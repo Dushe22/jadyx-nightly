@@ -38,6 +38,8 @@ public:
     }
 
     std::optional<std::vector<u8>> Find(const Key& key);
+    /// Whether a record for key is indexed; Find can still reject it if it was damaged since.
+    bool Contains(const Key& key) const;
     void Store(const Key& key, std::span<const u8> payload);
 
     void LogStats(std::string_view when) const;

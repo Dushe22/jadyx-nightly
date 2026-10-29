@@ -24,6 +24,8 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_d3d12/d3d12_compute_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_dxil_disk_cache.h"
+#include "video_core/renderer_d3d12/d3d12_exact_share_index.h"
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
 #include "video_core/renderer_d3d12/d3d12_linked_shader_cache.h"
 #include "video_core/renderer_d3d12/d3d12_memory_guard.h"
@@ -67,6 +69,10 @@ void SetGeometryDroppedShader(u64 unique_hash);
 /// "pso_eviction=0").
 void SetPipelineEviction(bool enabled);
 
+/// Experimental, off by default: idle dormant pipelines drop their DXIL when the DXIL disk cache
+/// holds it, and read it back on a worker when woken. Set before boot (boot.cfg "dxil_release=1").
+void SetDxilRelease(bool enabled);
+
 /// true writes transform feedback from the vertex shader to storage buffers instead of stream
 /// output: the fallback for a spirv_to_dxil.dll without it, for A/B comparison. Covers the vertex
 /// shader alone. Set before boot (boot.cfg "xfb=storage").
@@ -103,6 +109,15 @@ struct ShaderPools {
 struct ChargedDxilStages {
     GraphicsPipeline::LinkedDxil linked;
     Common::MemoryCharge charge;
+
+    /// Byte-exact: the bytecode and the stream output declaration, never the charge.
+    bool operator==(const ChargedDxilStages& other) const;
+};
+
+struct DxilDiskKeyHash {
+    size_t operator()(const DxilDiskCache::Key& key) const noexcept {
+        return static_cast<size_t>(key.lo ^ (key.hi * 0x9E3779B97F4A7C15ULL));
+    }
 };
 
 /// Guest shaders -> D3D12 pipelines, modeled on Vulkan::PipelineCache.
@@ -239,9 +254,19 @@ private:
     /// Every dynamic feature off: D3D12 bakes that state into the PSO.
     Vulkan::DynamicFeatures dynamic_features{};
 
+    /// Worker thread: the linked DXIL of a stored record, shared with a live copy of it.
+    GraphicsPipeline::SharedDxilStages ReloadDxil(const DxilDiskCache::Key& key,
+                                                  std::span<const size_t> stage_indices,
+                                                  bool native_xfb);
+
     std::filesystem::path pipeline_cache_filename;
 
     LinkedShaderCache<ChargedDxilStages> linked_shaders;
+    /// Linked DXIL that dormant pipelines can drop and read back, by DXIL disk cache record:
+    /// every pipeline reloading one record shares one live copy.
+    ExactShareIndex<DxilDiskCache::Key, ChargedDxilStages, DxilDiskKeyHash> reloadable_dxil;
+    std::atomic<u64> dxil_reloaded{};
+    u64 dxil_released{}; ///< GPU thread.
     OptionalCacheGate linked_shaders_gate;
 
     // Residency, GPU thread only once the disk cache is loaded.

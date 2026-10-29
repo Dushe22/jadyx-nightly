@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -117,7 +118,18 @@ public:
     std::vector<CompiledStage> CompilePipeline(std::span<const PipelineStage> stages,
                                                const PipelineOptions& options, u64 trace_pipeline = 0) const;
 
+    /// The DXIL disk cache record CompilePipeline reads or writes for these inputs, when that
+    /// record is on disk now: identity that outlives the SPIR-V. Hashes every SPIR-V word.
+    std::optional<DxilDiskCache::Key> StoredPipelineKey(std::span<const PipelineStage> stages,
+                                                        const PipelineOptions& options) const;
+    /// The stages of a record CompilePipeline stored, already signed; nullopt when it is missing,
+    /// damaged or has another stage count. Reads the file: call from a worker, never with a lock.
+    std::optional<std::vector<CompiledStage>> LoadStoredPipeline(
+        const DxilDiskCache::Key& key, size_t num_stages,
+        eden_spirv_to_dxil_stream_output* stream_output) const;
+
 private:
+    static u32 TranslateFlags(const PipelineOptions& options);
     void Sign(std::vector<u8>& dxil, u64 trace_pipeline = 0) const;
     DxilDiskCache::Key DiskCacheKey(std::span<const PipelineStage> stages,
                                     const PipelineOptions& options, u32 flags) const;

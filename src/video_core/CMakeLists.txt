@@ -542,6 +542,8 @@ if (ENABLE_D3D12)
         renderer_d3d12/d3d12_pipeline_key_tracking.h
         renderer_d3d12/d3d12_dxil_disk_cache.cpp
         renderer_d3d12/d3d12_dxil_disk_cache.h
+        renderer_d3d12/d3d12_bounded_admission.h
+        renderer_d3d12/d3d12_exact_share_index.h
         renderer_d3d12/d3d12_pipeline_residency.h
         renderer_d3d12/d3d12_pipeline_helper.h
         renderer_d3d12/d3d12_present_manager.cpp

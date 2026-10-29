@@ -439,8 +439,7 @@ std::vector<ShaderCompiler::CompiledStage> ShaderCompiler::CompilePipeline(
                      .conf = &confs[i]};
     }
 
-    const u32 flags = (options.flatten_vertex ? EDEN_SPIRV_TO_DXIL_FLATTEN_VERTEX : 0) |
-                      (options.emulate_reduction ? EDEN_SPIRV_TO_DXIL_EMULATE_REDUCTION : 0);
+    const u32 flags = TranslateFlags(options);
     DxilDiskCache& disk_cache = GetDxilDiskCache();
     const bool use_disk_cache = disk_cache.IsOpen() && translator_id != 0;
     DxilDiskCache::Key disk_key{};
@@ -516,6 +515,32 @@ std::vector<ShaderCompiler::CompiledStage> ShaderCompiler::CompilePipeline(
         disk_cache.Store(disk_key, EncodeStages(result, options.stream_output));
     }
     return result;
+}
+
+u32 ShaderCompiler::TranslateFlags(const PipelineOptions& options) {
+    return (options.flatten_vertex ? EDEN_SPIRV_TO_DXIL_FLATTEN_VERTEX : 0) |
+           (options.emulate_reduction ? EDEN_SPIRV_TO_DXIL_EMULATE_REDUCTION : 0);
+}
+
+std::optional<DxilDiskCache::Key> ShaderCompiler::StoredPipelineKey(
+    std::span<const PipelineStage> stages, const PipelineOptions& options) const {
+    DxilDiskCache& disk_cache = GetDxilDiskCache();
+    if (!disk_cache.IsOpen() || translator_id == 0) {
+        return std::nullopt;
+    }
+    const DxilDiskCache::Key key = DiskCacheKey(stages, options, TranslateFlags(options));
+    return disk_cache.Contains(key) ? std::optional{key} : std::nullopt;
+}
+
+std::optional<std::vector<ShaderCompiler::CompiledStage>> ShaderCompiler::LoadStoredPipeline(
+    const DxilDiskCache::Key& key, size_t num_stages,
+    eden_spirv_to_dxil_stream_output* stream_output) const {
+    DxilDiskCache& disk_cache = GetDxilDiskCache();
+    if (!disk_cache.IsOpen()) {
+        return std::nullopt;
+    }
+    const auto payload = disk_cache.Find(key);
+    return payload ? DecodeStages(*payload, num_stages, stream_output) : std::nullopt;
 }
 
 u64 ShaderCompiler::TranslatorGeneration() const {

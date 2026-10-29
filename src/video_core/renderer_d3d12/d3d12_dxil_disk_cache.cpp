@@ -152,6 +152,11 @@ std::optional<std::vector<u8>> DxilDiskCache::Find(const Key& key) {
     return payload;
 }
 
+bool DxilDiskCache::Contains(const Key& key) const {
+    std::scoped_lock lock{mutex};
+    return file.is_open() && index.contains(key);
+}
+
 void DxilDiskCache::Store(const Key& key, std::span<const u8> payload) {
     std::scoped_lock lock{mutex};
     if (!file.is_open() || payload.size() > MAX_RECORD_SIZE || index.contains(key)) {

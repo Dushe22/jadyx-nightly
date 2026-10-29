@@ -307,7 +307,9 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
         try {
             FT::ScopedSpan dxil_span{FT::Event::PipelineDxilLong, trace_pipeline};
             const u64 dxil_start = SteadyMicros();
-            dxil = compile_dxil(trace_pipeline, false);
+            auto built = compile_dxil(trace_pipeline, false);
+            dxil = std::move(built.dxil);
+            reload_dxil = std::move(built.reload);
             GetPipelineStats().Record(PipelineStage::Dxil, SteadyMicros() - dxil_start);
             compiled = true;
         } catch (const std::exception& exception) {
@@ -329,7 +331,9 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
             // this session, but trying to draw it makes it one of the pipelines built at boot.
             flatten_retry = false;
             try {
-                dxil = compile_dxil(trace_pipeline, true);
+                auto built = compile_dxil(trace_pipeline, true);
+                dxil = std::move(built.dxil);
+                reload_dxil = std::move(built.reload);
                 flattened_vertex = true;
             } catch (const std::exception& exception) {
                 BUG_TRACK_KEY(PipelineRejected, key.Hash(),
@@ -410,6 +414,22 @@ bool GraphicsPipeline::Wake(Common::ThreadWorker& worker) {
         return false;
     }
     QueueBuild(&worker, [this] {
+        if (!dxil) {
+            // Released by ReleaseDxil: read back here, never on the GPU thread.
+            try {
+                dxil = reload_dxil();
+            } catch (const std::exception& exception) {
+                LOG_ERROR(Render, "D3D12: reloading DXIL failed: {}", exception.what());
+            }
+            if (!dxil) {
+                // Without SPIR-V nothing can make it now; its draws are skipped this session.
+                BUG_TRACK_KEY(PipelineRejected, key.Hash(),
+                              "the released DXIL of VS {:016x} PS {:016x} could not be reloaded",
+                              key.unique_hashes[1], key.unique_hashes[5]);
+                Publish(State::Ready);
+                return;
+            }
+        }
         Build();
         Publish(State::Ready);
     });

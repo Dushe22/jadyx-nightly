@@ -186,8 +186,15 @@ public:
         std::vector<D3D12_SO_DECLARATION_ENTRY> stream_output;
     };
     using SharedDxilStages = std::shared_ptr<const LinkedDxil>;
+    /// Worker thread: the same linked DXIL again without its SPIR-V (the DXIL disk cache), or
+    /// null when it cannot be read back.
+    using ReloadDxil = std::function<SharedDxilStages()>;
+    struct BuiltDxil {
+        SharedDxilStages dxil;
+        ReloadDxil reload; ///< Empty when the DXIL cannot be reloaded: it is kept.
+    };
     /// (trace id, flatten the vertex stage's branches) -> linked DXIL.
-    using CompileDxil = std::function<SharedDxilStages(u64, bool)>;
+    using CompileDxil = std::function<BuiltDxil(u64, bool)>;
 
     /// compile_dxil (SPIR-V to DXIL, the costly part of a new pipeline) runs with the PSO build,
     /// on the worker when one is given; it throws std::exception when the pipeline cannot be made.
@@ -252,6 +259,18 @@ public:
     /// GPU thread: releases the PSO of a ready pipeline once the GPU is done with it, keeping the
     /// DXIL to build it again. Pipelines that failed have nothing to release. True if released.
     bool Evict(Scheduler& scheduler);
+
+    /// GPU thread: drops this pipeline's reference to the DXIL of a dormant pipeline that can
+    /// reload it, so Wake reads it back on its worker. The bytes are freed only once no linked
+    /// shader cache entry, PSO index key or other pipeline holds them. True if dropped.
+    bool ReleaseDxil() noexcept {
+        if (build_state.load(std::memory_order::acquire) != State::Dormant || !dxil ||
+            !reload_dxil) {
+            return false;
+        }
+        dxil.reset();
+        return true;
+    }
 
     /// GPU thread: the frame this pipeline was last drawn in.
     void Touch(u64 frame) noexcept {
@@ -384,6 +403,8 @@ private:
     const u32 lower_noperspective_mask;
     FragmentHelpers fragment_helpers{};
     SharedDxilStages dxil; ///< Immutable linked bytecode shared across fixed-state PSOs.
+    /// Written with dxil by the build worker; read by Wake's worker once ReleaseDxil dropped it.
+    ReloadDxil reload_dxil;
     std::array<bool, NUM_STAGES> has_stage{};
     std::array<std::shared_ptr<const StageBindings>, NUM_STAGES> stage_infos;
     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};

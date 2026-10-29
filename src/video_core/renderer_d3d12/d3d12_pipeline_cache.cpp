@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -37,6 +38,7 @@
 #include "video_core/renderer_d3d12/d3d12_local_memory_scratch.h"
 #include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
+#include "video_core/renderer_d3d12/d3d12_bounded_admission.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_stats.h"
 #include "video_core/renderer_d3d12/d3d12_dxil_disk_cache.h"
 #include "video_core/renderer_d3d12/d3d12_scheduler.h"
@@ -79,6 +81,7 @@ bool HasShaderHash(const std::array<std::atomic<u64>, 4>& slots, u64 unique_hash
     return false;
 }
 std::atomic_bool pipeline_eviction{true};
+std::atomic_bool dxil_release{};
 std::atomic_bool pipeline_prewarm{true};
 // EXPERIMENTAL default: 16 is only measured in one game so far, where it took a persistent compute
 // dispatch from ~82 ms to ~4.5 ms per frame on Series. If another game shows broken compute
@@ -411,6 +414,66 @@ void SetPipelineEviction(bool enabled) {
     pipeline_eviction.store(enabled, std::memory_order_relaxed);
 }
 
+void SetDxilRelease(bool enabled) {
+    dxil_release.store(enabled, std::memory_order_relaxed);
+}
+
+bool ChargedDxilStages::operator==(const ChargedDxilStages& other) const {
+    const auto same_entry = [](const D3D12_SO_DECLARATION_ENTRY& a,
+                               const D3D12_SO_DECLARATION_ENTRY& b) {
+        const bool same_name = a.SemanticName == b.SemanticName ||
+                               (a.SemanticName && b.SemanticName &&
+                                std::strcmp(a.SemanticName, b.SemanticName) == 0);
+        return same_name && a.Stream == b.Stream && a.SemanticIndex == b.SemanticIndex &&
+               a.StartComponent == b.StartComponent && a.ComponentCount == b.ComponentCount &&
+               a.OutputSlot == b.OutputSlot;
+    };
+    return linked.stages == other.linked.stages &&
+           std::ranges::equal(linked.stream_output, other.linked.stream_output, same_entry);
+}
+
+namespace {
+/// Linked stages as pipelines hold them, charged once to the ledger.
+ChargedDxilStages MakeChargedDxil(std::vector<ShaderCompiler::CompiledStage>& compiled,
+                                  std::span<const size_t> stage_indices,
+                                  const eden_spirv_to_dxil_stream_output* stream_output) {
+    ChargedDxilStages dxil;
+    u64 bytes = 0;
+    for (size_t i = 0; i < compiled.size(); ++i) {
+        bytes += compiled[i].dxil.capacity();
+        dxil.linked.stages[stage_indices[i]] = std::move(compiled[i].dxil);
+    }
+    if (stream_output) {
+        dxil.linked.stream_output = MakeStreamOutputDeclaration(*stream_output);
+        bytes += dxil.linked.stream_output.capacity() * sizeof(D3D12_SO_DECLARATION_ENTRY);
+    }
+    dxil.charge = Common::MemoryCharge(Common::MemoryAccount::ShaderBytecode, bytes);
+    return dxil;
+}
+} // Anonymous namespace
+
+GraphicsPipeline::SharedDxilStages PipelineCache::ReloadDxil(
+    const DxilDiskCache::Key& key, std::span<const size_t> stage_indices, bool native_xfb) {
+    // A live copy registered under the record: the same trust as the disk cache itself, which
+    // serves DXIL by this key alone. Copies read back are shared only when byte-equal (Share).
+    std::shared_ptr<const ChargedDxilStages> value = reloadable_dxil.Find(key);
+    if (!value) {
+        std::unique_ptr<eden_spirv_to_dxil_stream_output> stream_output;
+        if (native_xfb) {
+            stream_output = std::make_unique<eden_spirv_to_dxil_stream_output>();
+        }
+        auto stages = compiler.LoadStoredPipeline(key, stage_indices.size(), stream_output.get());
+        if (!stages) {
+            return nullptr;
+        }
+        value = reloadable_dxil.Share(key, std::make_shared<const ChargedDxilStages>(
+                                               MakeChargedDxil(*stages, stage_indices,
+                                                               stream_output.get())));
+        dxil_reloaded.fetch_add(1, std::memory_order_relaxed);
+    }
+    return GraphicsPipeline::SharedDxilStages(value, &value->linked);
+}
+
 void SetTransformFeedbackStorage(bool enabled) {
     transform_feedback_storage.store(enabled, std::memory_order_relaxed);
 }
@@ -574,9 +637,15 @@ void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler
             residency_cursor = 0;
         }
         GraphicsPipeline* const pipeline = residency_sweep[residency_cursor++];
-        if (residency_frame - pipeline->LastUsedFrame() > idle_frames &&
-            pipeline->Evict(scheduler)) {
-            ++pipelines_evicted;
+        if (residency_frame - pipeline->LastUsedFrame() > idle_frames) {
+            if (pipeline->Evict(scheduler)) {
+                ++pipelines_evicted;
+            }
+            // After Evict the pipeline is dormant; its PSO index key keeps the bytes until that
+            // PSO retires, so they are not freed yet.
+            if (dxil_release.load(std::memory_order_relaxed) && pipeline->ReleaseDxil()) {
+                ++dxil_released;
+            }
         }
     }
     TickPrewarm(snapshot);
@@ -594,9 +663,10 @@ void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler
         const auto resident = Common::ReadMemoryAccount(Common::MemoryAccount::PipelineStates);
         LOG_INFO(Render,
                  "D3D12: {} graphics pipelines, {} PSOs resident; {} released and {} rebuilt so "
-                 "far; {} drawn in recent sessions",
+                 "far; {} drawn in recent sessions; DXIL {} released, {} read back",
                  residency_sweep.size(), resident.objects, pipelines_evicted, pipelines_woken,
-                 hot_pipelines.Size());
+                 hot_pipelines.Size(), dxil_released,
+                 dxil_reloaded.load(std::memory_order_relaxed));
         LogPipelineStats("session");
     }
 }
@@ -901,11 +971,30 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         bool has_loaded{};
     } state;
 
+    // Each queued record holds its deserialized guest environments until a worker builds it:
+    // without a window the whole file sits in the queue. Serialized record bytes stand in for
+    // their memory. Acquired here on the loading thread, never on a worker, so it cannot wait on
+    // itself; tasks give their share back when they end. shortcut: 32 MiB/2x workers are not
+    // measured on Series yet; tune from the "disk load queue peak" log line.
+    BoundedAdmission admission{2 * static_cast<u64>(GetTotalPipelineWorkers()), 32ULL << 20};
+    std::streamoff record_start{};
+    const auto admit{[&](std::ifstream& file) {
+        const std::streamoff end = file.tellg();
+        const u64 bytes = end > record_start ? static_cast<u64>(end - record_start) : 0;
+        record_start = end;
+        return admission.Acquire(bytes, stop_loading);
+    }};
+
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        auto ticket = admit(file);
+        if (!ticket) {
+            return;
+        }
 
-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback,
+                           ticket = std::move(ticket)]() mutable {
             ShaderPools pools;
             auto pipeline{CreateComputePipeline(pools, key, env_, false)};
             std::scoped_lock lock{state.mutex};
@@ -922,13 +1011,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        auto ticket = admit(file);
+        if (!ticket) {
+            return;
+        }
         // Every pipeline gets its DXIL; only the hot ones a PSO, the rest when first drawn.
         const size_t file_index = state.graphics++;
         const bool build_pso = hot_pipelines.Prewarm(key.Hash(), file_index);
         state.prewarmed += build_pso ? 1 : 0;
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, build_pso,
-                           file_index]() mutable {
+                           file_index, ticket = std::move(ticket)]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
@@ -968,6 +1061,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render, "D3D12: disk load queue peak {} records, {} KiB serialized environments",
+             admission.PeakCount(), admission.PeakBytes() >> 10);
     const auto preparation = VideoCore::Perf::Read();
     LOG_INFO(Render,
              "D3D12 PSO preparation after disk load (session totals): {} requests, {} hits, "
@@ -1292,15 +1387,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             auto compiled = compiler.CompilePipeline(std::span(stages.data(), stages.size()),
                                                      linked_options, trace_pipeline);
-            ChargedDxilStages dxil;
-            u64 bytes = 0;
-            for (size_t i = 0; i < compiled.size(); ++i) {
-                bytes += compiled[i].dxil.capacity();
-                dxil.linked.stages[stage_indices[i]] = std::move(compiled[i].dxil);
-            }
+            ChargedDxilStages dxil = MakeChargedDxil(compiled, stage_indices, stream_output.get());
             if (stream_output) {
-                dxil.linked.stream_output = MakeStreamOutputDeclaration(*stream_output);
-                bytes += dxil.linked.stream_output.capacity() * sizeof(D3D12_SO_DECLARATION_ENTRY);
                 if (stream_output->missing_outputs != 0 || stream_output->dropped_entries != 0) {
                     BUG_TRACK_KEY(UnsupportedState, pipeline_key,
                                   "VS {:016x} stream output leaves {} captured outputs unwritten "
@@ -1309,7 +1397,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                   stream_output->dropped_entries);
                 }
             }
-            dxil.charge = Common::MemoryCharge(Common::MemoryAccount::ShaderBytecode, bytes);
             return dxil;
         }, [](const ChargedDxilStages& dxil) {
             size_t bytes = sizeof(dxil);
@@ -1325,7 +1412,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::PipelineCacheResult,
                                    static_cast<u64>(cached.outcome), trace_pipeline);
         // The pipeline keeps the whole entry, charge included, alive through its stages.
-        return GraphicsPipeline::SharedDxilStages(cached.value, &cached.value->linked);
+        GraphicsPipeline::BuiltDxil built{
+            GraphicsPipeline::SharedDxilStages(cached.value, &cached.value->linked)};
+        if (dxil_release.load(std::memory_order_relaxed)) {
+            // Only whether stream_output is set reaches the record's key.
+            eden_spirv_to_dxil_stream_output key_stream_output{};
+            ShaderCompiler::PipelineOptions stored_options = options;
+            stored_options.stream_output = native_xfb ? &key_stream_output : nullptr;
+            if (const auto disk_key = compiler.StoredPipelineKey(
+                    std::span(stages.data(), stages.size()), stored_options)) {
+                reloadable_dxil.Share(*disk_key, cached.value);
+                built.reload = [this, disk_key = *disk_key, stage_indices, native_xfb] {
+                    return ReloadDxil(disk_key, stage_indices, native_xfb);
+                };
+            }
+        }
+        return built;
     };
 
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};

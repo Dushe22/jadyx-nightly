@@ -170,6 +170,7 @@ void SetDredEnabled(bool enabled);         // d3d12_device.h
 void SetGpuBreadcrumbsEnabled(bool enabled); // d3d12_device.h
 void SetCloseProbeEnabled(bool enabled);     // d3d12_device.h
 void SetPipelineEviction(bool enabled);      // d3d12_pipeline_cache.h
+void SetDxilRelease(bool enabled);           // d3d12_pipeline_cache.h
 void SetPipelinePrewarm(bool enabled);       // d3d12_pipeline_cache.h
 void SetComputeWorkgroupSplit(u32 factor);   // d3d12_pipeline_cache.h
 void SetTransformFeedbackStorage(bool enabled); // d3d12_pipeline_cache.h
@@ -330,6 +331,8 @@ struct BootConfig {
     bool close_probe{};
     /// Release idle pipelines' PSOs ("pso_eviction=0" keeps them unless memory nearly runs out).
     bool pso_eviction{true};
+    /// Experimental: idle dormant pipelines drop DXIL the disk cache holds ("dxil_release=1").
+    bool dxil_release{};
     /// Build dormant PSOs in the background while memory is plentiful ("pso_prewarm=0" leaves
     /// them to their first draw).
     bool pso_prewarm{true};
@@ -664,6 +667,7 @@ int RunHeadlessBoot(const std::string& launch_path, const BootSurface& surface,
     D3D12::SetGpuBreadcrumbsEnabled(config.gpu_breadcrumbs);
     D3D12::SetCloseProbeEnabled(config.close_probe);
     D3D12::SetPipelineEviction(config.pso_eviction);
+    D3D12::SetDxilRelease(config.dxil_release);
     D3D12::SetPipelinePrewarm(config.pso_prewarm);
     D3D12::SetTransformFeedbackStorage(config.xfb_storage);
     Tegra::SetIndirectMacroCpuRead(config.indirect_macro_cpu);
@@ -2985,6 +2989,9 @@ struct BootView : implements<BootView, IFrameworkViewSource, IFrameworkView> {
                         } else if (line == "pso_eviction=0") {
                             config.pso_eviction = false;
                             WriteDiag("boot.cfg: idle pipelines keep their PSOs");
+                        } else if (line == "dxil_release=1") {
+                            config.dxil_release = true;
+                            WriteDiag("boot.cfg: idle dormant pipelines release stored DXIL");
                         } else if (line == "xfb=storage") {
                             config.xfb_storage = true;
                             WriteDiag("boot.cfg: transform feedback through storage buffers");
