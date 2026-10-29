@@ -4289,3 +4289,14 @@ en gameplay en 0.3.8.0. Cuphead DLC tiene reporte de finalización, no certifica
 general de ausencia de fallos. Odyssey conserva clasificación y resultado previo;
 el informe separado del crash se enlaza como limitación. No se cambian etiquetas
 de Discord, código ni paquetes. Validación documental: enlaces locales y diff.
+
+Cachés jerárquicas 28oct2026 (detalle en xbox_cache_hierarchy_threads.md):
+inspector offline `tools/xbox/inspect-caches.py` (DXIL JDXC/perfiles JIT, solo
+lectura, CityHash64 en streaming verificado contra C++) con 10 tests; cachés
+reales de dos títulos (incl. TOTK) válidas. DXIL recargable opt-in
+`dxil_release=1` y ventana acotada en LoadDiskResources (`BoundedAdmission`),
+ambos con test propio. 0.3.9.3 en Series: sin crash en Game, 0 DXIL/PSO
+liberados (sin presión); DXIL ~8 MiB no es palanca. Un OOM a 1024 MiB fue App
+type perdido al reinstalar. 0.3.9.4 instalada con alloc_watch de 8 tamaños del
+heap (~330 MiB vivos sin dueño) para medir TOTK (d3d12.bin 112 MB). Pendiente:
+App type Game, partida TOTK, resolver pilas con resolve-rva.py. Commits locales en feature/cache-hierarchy, sin push.

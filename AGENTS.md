@@ -1,5 +1,10 @@
 # AGENTS.md: guía para agentes de IA en Jadyx (fork de JulianDr14)
 
+Cachés jerárquicas28oct: inspector offline DXIL/JIT, DXIL recargable opt-in
+dxil_release=1 y ventana acotada en carga de disco, con tests. 0.3.9.4 instalada
+(Series) con alloc_watch para atribuir ~330MiB de heap; medición TOTK pendiente.
+Reponer App type Game tras cada instalación. Detalle xbox_cache_hierarchy_threads.md.
+
 Pulse20oct: rama feature/pulse-resume-audit desde main. Auditoría logsSeries.25:
 HID acepta/guarda revisionu32 pero restore limitaba0..3; codec conserva valor
 exacto y añade lognumérico, Pulse1.1.1 compatible1.1.0. Ocho revisiones/byteslegacy/
