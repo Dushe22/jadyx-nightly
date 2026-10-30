@@ -330,3 +330,48 @@ Validado: `tools/xbox/tests/bounded-admission.cpp` (cl /W4 /WX) y objeto UWP de
 colas de runtime (builds de demanda, Wake) siguen sin cota ni prioridad; en este
 título `d3d12.bin` pesa 3,2 MB, así que el ahorro esperado es pequeño. Cotas no
 medidas en Series.
+
+## Estado TOTK en Series (30oct2026)
+
+Mediciones (0100f2c0115b6000, App type Game, límite 5120 MiB):
+
+| Versión | Cambio | Pico commit | Resultado |
+|---|---|---|---|
+| 0.3.9.4 | alloc_watch, cola acotada | 4801 | sin crash; caché vacía |
+| 0.3.9.5 | jit_cache_mib=96 | 4795 | JIT 306 vs 335 MiB: casi nada |
+| 0.3.9.6 | drenaje dirigido de heaps | 5022 | +heaps liberados, pico igual, más tirones: retirado |
+| 0.3.9.7 | heaps de textura 32 MiB | 5038 | huecos 520→~250 MiB; texturas vivas 1052 en ráfaga |
+| 0.3.9.8 | Emergency GC 4 descargas/80 iter | 5082 | texturas ~820 en ráfaga (OK); bad_alloc por caché caliente |
+| 0.3.9.9 | DXIL de pipelines dormidos del arranque fuera | 5116 | OOM a 26,5 min; DXIL 167→36 MiB al arrancar, 87 al crashear |
+| 0.3.10.0 | pipelines frías hechas al dibujarse; GC de buffers bajo presión | 5115 | 13,6 min; 35k objetos de pipeline para 3,3k PSOs |
+| 0.3.10.1 | claves canónicas (depth bias, app_stage) | 5040 (solo en la carga) | estable 4760-4920 a los 12,6 min; 3864 objetos |
+
+Dueños confirmados del heap: patch_information de Dynarmic (hasta 38,5 MiB/núcleo),
+grabación de perfil JIT (14 MiB/núcleo), kernel emulado (~75 MiB), fuentes (17 MiB),
+macros GPU (2 MiB c/u). PSO liberados devuelven 0 KiB de commit. Prewarm JIT no
+actuó (sin perfiles en consola).
+
+Causa principal del crecimiento: TOTK cambia la pendiente del depth bias casi en cada
+draw (1552 valores cerca de -0,5) y la clave guardaba el float exacto. En la caché del
+28oct: 15389 claves de 1177 juegos de shaders; sin el bias, 4283. La Series no tiene
+depth bias dinámico (OPTIONS16), así que va en el PSO: `d3d12_key_canon.h` guarda el
+bias entero que usa el PSO y la pendiente con 8 bits de mantisa (error <= 0,2 %), y
+`Canonicalize()` también borra `app_stage` (solo Vulkan/OpenGL). Las claves de disco
+se normalizan al cargar: 69464 registros quedaron en 7438. Análisis offline:
+`keyvar.py` sobre `d3d12.bin` (formato de registro: envs serializados y clave de
+1072 bytes; tamaños sacados de las cabeceras con un programa de prueba).
+
+Otros cambios: en consola (límite < 8 GiB) sólo se crean al arrancar las pipelines con
+PSO de arranque; las demás se hacen desde los shaders vivos al dibujarse, con su DXIL
+del disco, y no se vuelven a escribir en `d3d12.bin`. El GC de buffers borra los que
+llevan 20 frames sin uso cuando quedan menos de 384 MiB libres.
+
+Pendiente:
+- La primera sesión tras 0.3.10.1 preparó sólo 345 PSOs de arranque (el historial usaba
+  las claves viejas); la siguiente debería volver a 4096 y bajar los tirones.
+- Texturas: ráfaga de 1081 MiB vivas en la carga del mundo y ~200 MiB libres dentro de
+  heaps (127 en los de render targets). TOTK recrea sus render targets de resolución
+  dinámica cientos de veces (800x448 creado 883 veces): reutilizarlos es lo siguiente.
+- Después: compactar patch_information, grabar menos perfil bajo presión.
+
+Logs en `build-uwp/console-logs/0.3.9.*-totk-*` y `0.3.10.*-totk-*`.
