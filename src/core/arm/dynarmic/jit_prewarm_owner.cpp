@@ -188,6 +188,10 @@ void Owner::Warm(const Progress& progress, std::size_t code_budget) {
         // A quarter of the cache stays for play: filled, it is cleared with every warmed block.
         code_budget = std::min(code_budget, space - space / 4);
         target->BeginWarm();
+        struct EndWarm {
+            Target& target;
+            ~EndWarm() { target.EndWarm(); }
+        } end_warm{*target};
         for (std::size_t n = 0; n < plan.size(); ++n) {
             if (used() >= code_budget) {
                 budget_skipped = plan.size() - n;

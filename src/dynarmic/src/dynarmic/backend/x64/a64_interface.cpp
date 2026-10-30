@@ -367,6 +367,15 @@ bool Jit::PrecompileBlock(const BlockProfile& block) {
     return impl->GetBlock(descriptor, &block) != nullptr;
 }
 
+void Jit::BeginPrecompile() {
+    ASSERT(!impl->is_executing);
+    impl->block_of_code.BeginWriteBatch();
+}
+
+void Jit::EndPrecompile() {
+    impl->block_of_code.EndWriteBatch();
+}
+
 std::size_t Jit::GetCodeCacheSpaceRemaining() const {
     ASSERT(!impl->is_executing);
     return impl->block_of_code.SpaceRemaining();

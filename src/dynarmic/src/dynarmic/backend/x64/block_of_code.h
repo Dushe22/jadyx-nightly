@@ -55,6 +55,10 @@ public:
     /// Between EnableWriting and DisableWriting: makes [where, where + size) writable too, for writes
     /// behind the current code pointer (block linking patches). No-op without paged W^X.
     void MakeWritable(CodePtr where, size_t size);
+    /// While the guest is stopped (precompile): one write window over many blocks instead of a
+    /// protection change per block. Nothing in the window can run until EndWriteBatch.
+    void BeginWriteBatch();
+    void EndWriteBatch();
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
@@ -192,6 +196,7 @@ private:
 #ifdef _WIN32
     size_t committed_size = 0;
 #endif
+    bool wx_batch = false; ///< inside BeginWriteBatch: DisableWriting waits for EndWriteBatch
 #if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
     // Paged W^X (see EnableWriting). Pages in [wx_exec_begin, wx_exec_end) hold emitted code and
     // are RX unless being written; committed pages past wx_exec_end are always RW. The constant

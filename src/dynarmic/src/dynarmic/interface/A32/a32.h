@@ -100,6 +100,9 @@ public:
     // a halfword, and code_bytes spans from the PC rounded down to a word.
     void SetBlockProfileCallback(std::function<void(const BlockProfile&)> callback);
     bool PrecompileBlock(const BlockProfile& block);
+    /// Around a run of PrecompileBlock: one code protection change for all of them.
+    void BeginPrecompile();
+    void EndPrecompile();
     std::size_t GetCodeCacheSpaceRemaining() const;
 
     /// @brief Disassemble the instructions following the current pc and return

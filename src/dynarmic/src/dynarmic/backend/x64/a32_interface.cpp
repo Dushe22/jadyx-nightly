@@ -244,6 +244,13 @@ struct Jit::Impl {
         return Common::DisassembleX64(p, p + size);
     }
 
+    void BeginPrecompile() {
+        block_of_code.BeginWriteBatch();
+    }
+    void EndPrecompile() {
+        block_of_code.EndWriteBatch();
+    }
+
     bool PrecompileBlock(const BlockProfile& block) {
         const IR::LocationDescriptor descriptor{block.descriptor};
         const A32::LocationDescriptor location{descriptor};
@@ -452,6 +459,15 @@ void Jit::SetBlockProfileCallback(std::function<void(const BlockProfile&)> callb
 bool Jit::PrecompileBlock(const BlockProfile& block) {
     ASSERT(!is_executing);
     return impl->PrecompileBlock(block);
+}
+
+void Jit::BeginPrecompile() {
+    ASSERT(!is_executing);
+    impl->BeginPrecompile();
+}
+
+void Jit::EndPrecompile() {
+    impl->EndPrecompile();
 }
 
 std::size_t Jit::GetCodeCacheSpaceRemaining() const {

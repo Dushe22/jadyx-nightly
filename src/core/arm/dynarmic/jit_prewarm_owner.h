@@ -34,6 +34,8 @@ public:
     virtual std::size_t CodeCacheSpaceRemaining() const = 0;
     /// Before a warm pass: drop state that caches guest code between compiles.
     virtual void BeginWarm() {}
+    /// After a warm pass, also when it threw: its blocks become executable.
+    virtual void EndWarm() {}
 };
 
 /// Any dynarmic Jit with the profile API (A64::Jit, A32::Jit), with the frontend callbacks
@@ -54,6 +56,10 @@ public:
     }
     void BeginWarm() override {
         callbacks.last_code_addr = u64(-1);
+        jit.BeginPrecompile();
+    }
+    void EndWarm() override {
+        jit.EndPrecompile();
     }
 
 private:

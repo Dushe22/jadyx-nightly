@@ -743,7 +743,7 @@ void BlockOfCode::EnableWriting() {
 void BlockOfCode::DisableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
-    if (!prelude_complete || !wx_writing || dual_mapped) {
+    if (!prelude_complete || !wx_writing || dual_mapped || wx_batch) {
         return;
     }
     wx_writing = false;
@@ -773,6 +773,16 @@ void BlockOfCode::DisableWriting() {
 #endif
 }
 
+void BlockOfCode::BeginWriteBatch() {
+    EnableWriting();
+    wx_batch = true;
+}
+
+void BlockOfCode::EndWriteBatch() {
+    wx_batch = false;
+    DisableWriting();
+}
+
 void BlockOfCode::MakeWritable([[maybe_unused]] CodePtr where, [[maybe_unused]] size_t size) {
 #if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
     if (!prelude_complete || !wx_writing || dual_mapped) {
@@ -793,6 +803,10 @@ void BlockOfCode::MakeWritable([[maybe_unused]] CodePtr where, [[maybe_unused]] 
 
 void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
+    const bool batch = wx_batch;
+    if (batch) {
+        EndWriteBatch();
+    }
     SetCodePtr(code_begin);
 #if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
     // Code is emitted from code_begin again: hand the old blocks' pages back to the RW tail.
@@ -803,6 +817,9 @@ void BlockOfCode::ClearCache() {
     }
     ReleaseMemoryPastCap();
 #endif
+    if (batch) {
+        BeginWriteBatch();
+    }
 }
 
 #if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
