@@ -223,6 +223,7 @@ void Owner::Warm(const Progress& progress, std::size_t code_budget) {
                  p.layout->name, p.core,
                  std::count_if(p.loaded.begin(), p.loaded.end(), [](const auto& r) { return r.gameplay_samples != 0; }),
                  priority_accepted, p.shared.size(), shared_accepted);
+        p.ReleaseLoaded();
     } catch (const std::exception& e) {
         LOG_WARNING(Core, "JIT prewarm {} core {}: incomplete, using normal JIT: {}", p.layout->name, p.core,
                     e.what());
@@ -236,6 +237,21 @@ void Owner::Save() {
         return;
     }
     try {
+        if (p.loaded_released) {
+            // The file holds what was loaded; an unreadable one is kept rather than overwritten.
+            std::error_code ec;
+            const auto bytes = std::filesystem::file_size(p.path, ec);
+            if (!ec) {
+                std::ifstream file{p.path, std::ios::binary};
+                if (!Read(file, bytes, *p.layout, p.title, p.build, p.core, p.loaded)) {
+                    LOG_WARNING(Core, "JIT profile {} core {}: unreadable at save, previous profile retained",
+                                p.layout->name, p.core);
+                    return;
+                }
+            }
+            p.loaded_released = false;
+            p.loaded_fingerprints = decltype(p.loaded_fingerprints){};
+        }
         Merge(p.loaded, p.observed);
         Merge(p.loaded, p.gameplay_observed);
         const auto observed = p.observed.size(), gameplay = p.gameplay_observed.size();

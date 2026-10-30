@@ -178,6 +178,31 @@ int main() {
     assert(p.Classify(Record{0x200, 1, 4}) == Miss::OtherCore);
     assert(p.Classify(Record{0x200 | A64Layout.state_mask, 1, 4}) == Miss::FpcrVariant);
     assert(p.Classify(Record{0x300, 1, 4}) == Miss::Unlearned);
+    {
+        // Released after warming: same answers from the catalog's own keys and fingerprints.
+        Profile q{A64Layout};
+        q.loaded = {{8, 1, 8}, {0x100, 1, 4, 3}};
+        q.status = {WarmStatus::Rejected, WarmStatus::Accepted};
+        auto own = std::make_shared<Catalog>(A64Layout);
+        own->descriptors[0] = {8, 0x100};
+        own->descriptors[1] = {0x200};
+        q.catalog = own;
+        const Record kept = q.loaded[0], warmed = q.loaded[1];
+        auto edited = kept; edited.code_bytes = 12;
+        q.ReleaseLoaded();
+        assert(q.loaded_released && q.loaded.empty() && q.loaded.capacity() == 0);
+        assert(q.Classify(kept) == Miss::Rejected && q.Classify(warmed) == Miss::Recompiled);
+        assert(q.Classify(edited) == Miss::CodeChanged);
+        assert(q.Classify(Record{0x200, 1, 4}) == Miss::OtherCore);
+        assert(q.Classify(Record{0x300, 1, 4}) == Miss::Unlearned);
+        // Keys that do not match loaded (another core's registration): nothing is released.
+        Profile r{A64Layout};
+        r.loaded = {{8, 1, 8}};
+        r.status = {WarmStatus::Budget};
+        r.catalog = std::make_shared<Catalog>(A64Layout);
+        r.ReleaseLoaded();
+        assert(!r.loaded_released && r.loaded.size() == 1);
+    }
     p.observed.resize(MaxRecords - GameplayCapacity);
     capture_active.store(true);
     p.Observe(Record{0x1008 | A64Layout.state_mask, 1, 8});

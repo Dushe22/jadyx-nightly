@@ -293,6 +293,28 @@ struct Profile {
     std::vector<WarmStatus> shared_status;
     std::shared_ptr<const Catalog> catalog;
     std::size_t dropped{};
+    /// Set once warming is done and loaded is released (12 MiB a core in a large game): Classify
+    /// then finds own records in catalog->descriptors[core], in the same order, with a 32-bit
+    /// fingerprint of each one's code; Save reads the file again to merge.
+    bool loaded_released{};
+    std::vector<std::uint32_t> loaded_fingerprints;
+
+    static std::uint32_t Fingerprint(std::uint64_t code_hash, std::uint32_t code_bytes) {
+        return static_cast<std::uint32_t>(code_hash ^ (code_hash >> 32)) ^ (code_bytes * 0x9e3779b9U);
+    }
+
+    void ReleaseLoaded() {
+        if (loaded.empty() || !catalog || core >= catalog->descriptors.size() ||
+            catalog->descriptors[core].size() != loaded.size()) {
+            return;
+        }
+        loaded_fingerprints.resize(loaded.size());
+        for (std::size_t i = 0; i < loaded.size(); ++i) {
+            loaded_fingerprints[i] = Fingerprint(loaded[i].code_hash, loaded[i].code_bytes);
+        }
+        loaded = decltype(loaded){};
+        loaded_released = true;
+    }
 
     bool Contains(std::uint64_t pc, std::uint32_t bytes) const {
         const auto next = std::upper_bound(executable_ranges.begin(), executable_ranges.end(), pc,
@@ -375,12 +397,27 @@ struct Profile {
     }
 
     Miss Classify(const Record& relative) const {
-        const auto found = std::lower_bound(loaded.begin(), loaded.end(), relative.descriptor,
-            [](const auto& r, auto descriptor) { return r.descriptor < descriptor; });
-        if (found != loaded.end() && found->descriptor == relative.descriptor) {
-            if (found->code_hash != relative.code_hash || found->code_bytes != relative.code_bytes)
+        std::optional<std::size_t> own;
+        bool code_changed{};
+        if (loaded_released) {
+            const auto& keys = catalog->descriptors[core];
+            const auto found = std::lower_bound(keys.begin(), keys.end(), relative.descriptor);
+            if (found != keys.end() && *found == relative.descriptor) {
+                own = static_cast<std::size_t>(found - keys.begin());
+                code_changed = loaded_fingerprints[*own] != Fingerprint(relative.code_hash, relative.code_bytes);
+            }
+        } else {
+            const auto found = std::lower_bound(loaded.begin(), loaded.end(), relative.descriptor,
+                [](const auto& r, auto descriptor) { return r.descriptor < descriptor; });
+            if (found != loaded.end() && found->descriptor == relative.descriptor) {
+                own = static_cast<std::size_t>(found - loaded.begin());
+                code_changed = found->code_hash != relative.code_hash || found->code_bytes != relative.code_bytes;
+            }
+        }
+        if (own) {
+            if (code_changed)
                 return Miss::CodeChanged;
-            switch (status[static_cast<std::size_t>(found - loaded.begin())]) {
+            switch (status[*own]) {
             case WarmStatus::Budget: return Miss::Budget;
             case WarmStatus::Rejected: return Miss::Rejected;
             case WarmStatus::Accepted: return Miss::Recompiled;
