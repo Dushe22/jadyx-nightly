@@ -340,6 +340,12 @@ struct BootConfig {
     /// Pipeline builder threads ("pso_workers=1..8"), 0 for the default: for timing the boot's
     /// pipeline loading and its memory peak at 1, 2 or 4.
     u32 pso_workers{};
+    /// Probe ("dram_file_probe=1"): whether pages of a file-backed view count in the app's memory
+    /// and commit, and how many 64 MiB views the console maps, before moving DRAM to a file.
+    bool dram_file_probe{};
+    /// Without fastmem, this much of the top of the application pool lives in a file view the
+    /// console does not charge to the app ("dram_file_mib=0..512"); 0 keeps it all private.
+    u32 dram_file_mib{};
     /// Transform feedback through vertex shader storage writes instead of stream output
     /// ("xfb=storage"): the fallback, for A/B comparison.
     bool xfb_storage{};
@@ -617,6 +623,7 @@ int RunHeadlessBoot(const std::string& launch_path, const BootSurface& surface,
     Settings::values.cpuopt_fastmem_exclusives = fastmem_enabled;
     Common::ConfigureHostMemoryFastmem(config.fastmem_hot_mib,
                                        config.fastmem == BootConfig::Fastmem::Full);
+    Common::ConfigureHostMemoryFileWindow(fastmem_enabled ? 0 : config.dram_file_mib);
     // Keep the shared setting for other backends. D3D12 prepares on workers and always waits
     // for the exact PSO when a dependent draw reaches the command stream.
     Settings::values.use_asynchronous_shaders.SetValue(config.async_shaders);
@@ -1950,6 +1957,93 @@ std::string MemoryReport() {
     }
 }
 
+// dram_file_probe=1: 0.2.56 wrote one byte per MiB (4 MiB of pages) and saw 8 MiB of app memory,
+// which cannot tell whether file-backed pages are charged. This writes every page.
+void ProbeFileBackedDram() {
+    using winrt::Windows::System::MemoryManager;
+    constexpr u64 VIEW = 64ULL << 20;
+    constexpr u32 MAX_VIEWS = 24; // 1.5 GiB, above the ~1 GiB 0.2.56 saw
+    constexpr u32 WRITTEN_VIEWS = 8;
+    const auto sample = [] {
+        const auto report = MemoryManager::GetAppMemoryReport();
+        return std::pair{MemoryManager::AppMemoryUsage() >> 20, report.TotalCommitUsage() >> 20};
+    };
+    wchar_t temp[MAX_PATH]{};
+    const DWORD length = GetTempPathW(MAX_PATH, temp);
+    if (length == 0 || length >= MAX_PATH) {
+        WriteDiag("dram probe: no temp folder, error " + std::to_string(GetLastError()));
+        return;
+    }
+    CREATEFILE2_EXTENDED_PARAMETERS params{.dwSize = sizeof(params),
+                                           .dwFileAttributes = FILE_ATTRIBUTE_TEMPORARY,
+                                           .dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE};
+    const HANDLE file = CreateFile2((std::wstring(temp) + L"jadyx_dram_probe.bin").c_str(),
+                                    GENERIC_READ | GENERIC_WRITE, 0, CREATE_ALWAYS, &params);
+    if (file == INVALID_HANDLE_VALUE) {
+        WriteDiag("dram probe: file failed, error " + std::to_string(GetLastError()));
+        return;
+    }
+    const HANDLE section =
+        CreateFileMappingFromApp(file, nullptr, PAGE_READWRITE, VIEW * MAX_VIEWS, nullptr);
+    if (!section) {
+        WriteDiag("dram probe: section failed, error " + std::to_string(GetLastError()));
+        CloseHandle(file);
+        return;
+    }
+    const auto [usage0, commit0] = sample();
+    std::vector<u8*> views;
+    DWORD map_error{};
+    for (u32 i = 0; i < MAX_VIEWS; ++i) {
+        auto* view = static_cast<u8*>(MapViewOfFileFromApp(section, FILE_MAP_WRITE, VIEW * i, VIEW));
+        if (!view) {
+            map_error = GetLastError();
+            break;
+        }
+        views.push_back(view);
+    }
+    const auto [usage1, commit1] = sample();
+    WriteDiag("dram probe: mapped " + std::to_string(views.size()) + " of " +
+              std::to_string(MAX_VIEWS) + " 64 MiB views" +
+              (map_error ? ", then error " + std::to_string(map_error) : std::string{}) +
+              "; app " + std::to_string(usage0) + " -> " + std::to_string(usage1) +
+              " MiB, commit " + std::to_string(commit0) + " -> " + std::to_string(commit1) + " MiB");
+    const u32 written = (std::min)(WRITTEN_VIEWS, static_cast<u32>(views.size()));
+    const auto touch = [&](bool write) {
+        const ULONGLONG start = GetTickCount64();
+        u64 sum = 0;
+        for (u32 i = 0; i < written; ++i) {
+            for (u64 offset = 0; offset < VIEW; offset += 4096) {
+                volatile u8* page = views[i] + offset;
+                if (write) {
+                    *page = static_cast<u8>(offset >> 12 | 1);
+                } else {
+                    sum += *page;
+                }
+            }
+        }
+        return std::pair{GetTickCount64() - start, sum};
+    };
+    const auto [write_ms, unused] = touch(true);
+    const auto [usage2, commit2] = sample();
+    ::Sleep(2000); // let the system write back or trim before reading again
+    const auto [read_ms, sum] = touch(false);
+    const auto [usage3, commit3] = sample();
+    WriteDiag("dram probe: wrote every page of " + std::to_string(written * 64) + " MiB in " +
+              std::to_string(write_ms) + " ms: app " + std::to_string(usage1) + " -> " +
+              std::to_string(usage2) + " MiB, commit " + std::to_string(commit1) + " -> " +
+              std::to_string(commit2) + " MiB; read back in " + std::to_string(read_ms) +
+              " ms (checksum " + std::to_string(sum) + "): app " + std::to_string(usage3) +
+              " MiB, commit " + std::to_string(commit3) + " MiB");
+    for (u8* view : views) {
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(section);
+    CloseHandle(file);
+    const auto [usage4, commit4] = sample();
+    WriteDiag("dram probe: released: app " + std::to_string(usage4) + " MiB, commit " +
+              std::to_string(commit4) + " MiB");
+}
+
 // Free space where Jadyx Portal can put games: LocalState and Dev Mode's storage on D:.
 std::string StorageReport() {
     std::string out = "storage:";
@@ -2949,6 +3043,18 @@ struct BootView : implements<BootView, IFrameworkViewSource, IFrameworkView> {
                         constexpr std::string_view key = "run_seconds=";
                         constexpr std::string_view hunt_at_key = "hunt_at=";
                         // Outside the else-if chain below: it is at MSVC's nesting limit.
+                        if (line.starts_with("dram_file_mib=")) {
+                            config.dram_file_mib = (std::min)(
+                                static_cast<u32>(std::strtoul(line.c_str() + 14, nullptr, 10)),
+                                512U);
+                            WriteDiag("boot.cfg: " + std::to_string(config.dram_file_mib) +
+                                      " MiB of DRAM in a file window");
+                            continue;
+                        }
+                        if (line == "dram_file_probe=1") {
+                            config.dram_file_probe = true;
+                            continue;
+                        }
                         if (line.starts_with("pso_workers=")) {
                             config.pso_workers = std::clamp<u32>(
                                 static_cast<u32>(std::strtoul(line.c_str() + 12, nullptr, 10)), 1, 8);
@@ -3486,6 +3592,9 @@ struct BootView : implements<BootView, IFrameworkViewSource, IFrameworkView> {
                             config.game = line.substr(5);
                             WriteDiag("boot.cfg: game " + config.game);
                         }
+                    }
+                    if (config.dram_file_probe) {
+                        ProbeFileBackedDram();
                     }
                     const std::string local_path = winrt::to_string(
                         Windows::Storage::ApplicationData::Current().LocalFolder().Path());

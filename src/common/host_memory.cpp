@@ -105,6 +105,14 @@ bool HostMemoryFastmemForceFull() {
     return g_fastmem_force_full.load(std::memory_order_acquire);
 }
 
+namespace {
+std::atomic<size_t> g_file_window_size{0};
+}
+
+void ConfigureHostMemoryFileWindow(size_t mib) {
+    g_file_window_size.store((std::min)(mib, size_t{512}) << 20, std::memory_order_release);
+}
+
 #ifdef _WIN32
 
 // Manually imported for MinGW compatibility
@@ -236,6 +244,14 @@ std::atomic<size_t> g_arena_size{0};
 std::atomic<bool> g_backing_is_section{false};
 std::atomic<bool> g_backing_is_file{false};
 std::atomic<bool> g_backing_file_sparse{false};
+// File window of the private backing ("dram_file_mib=N"): these DRAM pages are a view of a file,
+// which the console does not charge to the app (0.3.10.9 probe: 512 MiB written, +59 MiB).
+std::atomic<uintptr_t> g_window_begin{0};
+std::atomic<uintptr_t> g_window_end{0};
+bool InWindow(uintptr_t address) {
+    return address >= g_window_begin.load(std::memory_order_acquire) &&
+           address < g_window_end.load(std::memory_order_acquire);
+}
 PFN_VirtualAllocFromApp g_pfn_virtual_alloc_from_app{nullptr};
 PFN_AddVectoredExceptionHandler g_pfn_add_veh{nullptr};
 PFN_RemoveVectoredExceptionHandler g_pfn_remove_veh{nullptr};
@@ -429,6 +445,9 @@ LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
     if (fault_addr < base || fault_addr >= base + size) {
         return EXCEPTION_CONTINUE_SEARCH; // not our backing — let other handlers run
     }
+    if (InWindow(reinterpret_cast<uintptr_t>(fault_addr))) {
+        return EXCEPTION_CONTINUE_SEARCH; // file view: always committed, never demand-committed
+    }
     const size_t offset = static_cast<size_t>(fault_addr - base);
     const size_t chunk_offset = offset & ~(BACKING_COMMIT_GRANULARITY - 1);
     const size_t chunk_len = (std::min)(BACKING_COMMIT_GRANULARITY, size - chunk_offset);
@@ -521,6 +540,13 @@ public:
             LOG_WARNING(HW_Memory, "Hybrid fastmem unavailable, using the private backing");
             Release();
         }
+        if (g_file_window_size.load(std::memory_order_acquire) != 0) {
+            if (InitFileWindow()) {
+                return true;
+            }
+            LOG_WARNING(HW_Memory, "DRAM file window unavailable, using the private backing");
+            Release();
+        }
         backing_base = static_cast<u8*>(
             g_pfn_virtual_alloc_from_app(nullptr, backing_size, MEM_RESERVE, PAGE_READWRITE));
         if (backing_base == nullptr) {
@@ -585,6 +611,115 @@ public:
     /// Xbox fastmem: only a bounded hot slice of the application pool is section-backed. The private
     /// reservations and the mapped section remain adjacent, so every existing BackingBasePointer
     /// user still sees one linear DRAM allocation. Only the section-backed range can be aliased.
+    /// Private backing with one window, at the top of the application pool where the game maps
+    /// most, that is a view of a temporary file. No fastmem arena: the guest reaches it through
+    /// the page table like the rest. Reuses the hybrid split and teardown.
+    bool InitFileWindow() {
+        if (!pfn_CreateFileMappingFromApp || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 ||
+            !pfn_UnmapViewOfFile2 || !g_pfn_virtual_alloc_from_app || !g_pfn_add_veh) {
+            return false;
+        }
+        constexpr size_t Granule = size_t{64} << 10;
+        const size_t window_end = AlignDown(fastmem_region.offset + fastmem_region.size, Granule);
+        const size_t window_size =
+            AlignDown((std::min)(g_file_window_size.load(std::memory_order_acquire), window_end),
+                      Granule);
+        if (window_size == 0 || window_end > backing_size) {
+            return false;
+        }
+        hybrid_hot_offset = window_end - window_size;
+        hybrid_hot_size = window_size;
+        backing_file = OpenBackingFile();
+        // The rest stays private: trims, decommits and commit stats treat it as before.
+        g_backing_is_file.store(false, std::memory_order_release);
+        if (backing_file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        backing_handle = pfn_CreateFileMappingFromApp(backing_file, nullptr, PAGE_READWRITE,
+                                                      window_size, nullptr);
+        if (!backing_handle) {
+            LOG_WARNING(HW_Memory, "Failed to create the DRAM file window, error {}",
+                        GetLastError());
+            return false;
+        }
+        file_window = true;
+        if (!SplitHybridBacking()) {
+            return false;
+        }
+        g_backing_base.store(backing_base, std::memory_order_release);
+        g_backing_size.store(backing_size, std::memory_order_release);
+        g_window_begin.store(reinterpret_cast<uintptr_t>(backing_base + hybrid_hot_offset),
+                             std::memory_order_release);
+        g_window_end.store(reinterpret_cast<uintptr_t>(backing_base + hybrid_hot_offset) +
+                               hybrid_hot_size,
+                           std::memory_order_release);
+        g_backing_veh = g_pfn_add_veh(/*first=*/1, BackingDemandCommitHandler);
+        if (!g_backing_veh) {
+            LOG_WARNING(HW_Memory, "Failed to install the backing demand-commit handler");
+            return false;
+        }
+        LOG_INFO(HW_Memory, "DRAM file window: {} MiB at DRAM offset {:#x} ({})",
+                 hybrid_hot_size >> 20, hybrid_hot_offset,
+                 g_backing_file_sparse.load() ? "sparse" : "not sparse");
+        return true;
+    }
+
+    /// [private prefix | file view | private suffix] over one placeholder reservation.
+    bool SplitHybridBacking() {
+        backing_base = static_cast<u8*>(pfn_VirtualAlloc2(
+            process, nullptr, backing_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+            nullptr, 0));
+        if (!backing_base) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid backing, error {}", GetLastError());
+            return false;
+        }
+        hybrid = true;
+        if (hybrid_hot_offset != 0 &&
+            !VirtualFree(backing_base, hybrid_hot_offset,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_WARNING(HW_Memory, "Failed to split the hybrid backing prefix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_split_prefix = hybrid_hot_offset != 0;
+        if (hybrid_hot_offset + hybrid_hot_size != backing_size &&
+            !VirtualFree(backing_base + hybrid_hot_offset, hybrid_hot_size,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_WARNING(HW_Memory, "Failed to split the hybrid backing suffix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_split_suffix = hybrid_hot_offset + hybrid_hot_size != backing_size;
+        if (hybrid_hot_offset != 0 &&
+            pfn_VirtualAlloc2(process, backing_base, hybrid_hot_offset,
+                              MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                              0) != backing_base) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid private prefix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_prefix_private = hybrid_hot_offset != 0;
+        const size_t suffix_offset = hybrid_hot_offset + hybrid_hot_size;
+        if (suffix_offset != backing_size &&
+            pfn_VirtualAlloc2(process, backing_base + suffix_offset, backing_size - suffix_offset,
+                              MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                              0) != backing_base + suffix_offset) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid private suffix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_suffix_private = suffix_offset != backing_size;
+        if (pfn_MapViewOfFile3(backing_handle, process, backing_base + hybrid_hot_offset, 0,
+                               hybrid_hot_size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                               0) != backing_base + hybrid_hot_offset) {
+            LOG_WARNING(HW_Memory, "Failed to map the hybrid canonical view, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_canonical_mapped = true;
+        return true;
+    }
+
     bool InitHybridSection() {
         if (!pfn_CreateFileMappingFromApp || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 ||
             !pfn_UnmapViewOfFile2 || !g_pfn_virtual_alloc_from_app || !g_pfn_add_veh) {
@@ -929,7 +1064,7 @@ public:
     }
 
     bool IsSection() const {
-        return backing_handle != nullptr;
+        return backing_handle != nullptr && !file_window;
     }
 
     /// VirtualProtect over a view of the reserved section fails on pages still only reserved, and
@@ -1138,7 +1273,10 @@ private:
             VirtualFree(backing_base, 0, MEM_RELEASE);
             backing_base = nullptr;
             hybrid = false;
+            file_window = false;
             hybrid_alias_bytes = 0;
+            g_window_begin.store(0, std::memory_order_release);
+            g_window_end.store(0, std::memory_order_release);
         } else {
             UnmapBackingViews();
         }
@@ -1337,6 +1475,7 @@ private:
     static constexpr size_t MaxHybridAliasBudget = size_t{512} << 20;
     static constexpr size_t HybridTotalViewBudget = size_t{896} << 20;
     bool hybrid{};
+    bool file_window{}; ///< hybrid split without fastmem: a file view inside the private backing
     bool hybrid_canonical_mapped{};
     bool hybrid_split_prefix{};
     bool hybrid_split_suffix{};
@@ -1910,7 +2049,28 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     // Over a file every page reads as committed. A page never written is a hole of the file and
     // reads as zero, and memset would dirty it and give it a disk block, so pages already zero are
     // only read.
-    if (fill_value == 0 && g_backing_is_file.load(std::memory_order_acquire)) {
+    const uintptr_t window_begin = g_window_begin.load(std::memory_order_acquire);
+    const uintptr_t window_end = g_window_end.load(std::memory_order_acquire);
+    const auto clear_begin = reinterpret_cast<uintptr_t>(backing_base + physical_offset);
+    const uintptr_t clear_end = clear_begin + length;
+    bool in_window = false;
+    if (fill_value == 0 && window_begin < window_end && clear_begin < window_end &&
+        clear_end > window_begin) {
+        if (clear_begin < window_begin || clear_end > window_end) {
+            // Straddles the window: clear each side the way its pages need.
+            const size_t window_offset = window_begin - reinterpret_cast<uintptr_t>(backing_base);
+            const size_t window_last = window_end - reinterpret_cast<uintptr_t>(backing_base);
+            const size_t begin = physical_offset;
+            const size_t end = physical_offset + length;
+            if (begin < window_offset) ClearBackingRegion(begin, window_offset - begin, 0);
+            const size_t inner = (std::max)(begin, window_offset);
+            ClearBackingRegion(inner, (std::min)(end, window_last) - inner, 0);
+            if (end > window_last) ClearBackingRegion(window_last, end - window_last, 0);
+            return;
+        }
+        in_window = true;
+    }
+    if (fill_value == 0 && (in_window || g_backing_is_file.load(std::memory_order_acquire))) {
         constexpr uintptr_t HostPageSize = 4096;
         const auto begin = reinterpret_cast<uintptr_t>(backing_base + physical_offset);
         const auto end = begin + length;
@@ -1985,7 +2145,7 @@ void ForEachCommittedRun(u8* begin, u8* end, F&& committed) {
             return;
         }
         u8* const region_end = (std::min)(static_cast<u8*>(info.BaseAddress) + info.RegionSize, end);
-        if (info.State == MEM_COMMIT) {
+        if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
             committed(address, region_end);
         }
         address = region_end;
@@ -2114,7 +2274,8 @@ size_t TrimSpan(u8* span, size_t& released) {
             SPAN_PAGES,
             static_cast<size_t>(static_cast<u8*>(info.BaseAddress) + info.RegionSize - span) /
                 HOST_PAGE_SIZE);
-        if (info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE) {
+        if (info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE &&
+            info.Type == MEM_PRIVATE) {
             for (size_t i = page; i < end; ++i) committed.set(i);
         }
         page = (std::max)(end, page + 1);
@@ -2200,7 +2361,7 @@ std::optional<u64> EmulatedDramCommittedBytes() {
         }
         u8* const region_end =
             (std::min)(static_cast<u8*>(info.BaseAddress) + info.RegionSize, base + size);
-        if (info.State == MEM_COMMIT) {
+        if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) { // not the file window
             committed += static_cast<u64>(region_end - address);
         }
         address = region_end;
@@ -2248,6 +2409,11 @@ std::string HostMemoryCommitStats() {
         }
         std::string stats =
             "emulated DRAM " + std::to_string(*EmulatedDramCommittedBytes() >> 20) + " MiB";
+        if (const uintptr_t window = g_window_end.load(std::memory_order_acquire) -
+                                     g_window_begin.load(std::memory_order_acquire);
+            window != 0) {
+            stats += " private + " + std::to_string(window >> 20) + " MiB file window";
+        }
         if (const u64 failures = g_commit_failures.load(std::memory_order_relaxed); failures != 0) {
             stats += ", " + std::to_string(failures) + " DRAM commit failures (last error " +
                      std::to_string(g_last_commit_error.load(std::memory_order_relaxed)) + ")";

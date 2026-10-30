@@ -24,6 +24,9 @@ struct HostMemoryFastmemRegion {
 void ConfigureHostMemoryFastmem(size_t hot_mib, bool force_full);
 [[nodiscard]] size_t HostMemoryFastmemHotSize();
 [[nodiscard]] bool HostMemoryFastmemForceFull();
+/// Without fastmem, puts this much (<= 512 MiB) of the top of the application pool in a file
+/// view that the console does not charge to the app. 0 keeps the backing all private.
+void ConfigureHostMemoryFileWindow(size_t mib);
 
 enum class MemoryPermission : u32 {
     Read = 1 << 0,
