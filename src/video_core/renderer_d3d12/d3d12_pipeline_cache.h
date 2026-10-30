@@ -260,6 +260,9 @@ private:
                                                   bool native_xfb);
 
     std::filesystem::path pipeline_cache_filename;
+    /// Key hashes of the disk-cache pipelines not made at boot, so they are not stored twice.
+    /// Loading thread, then GPU thread only.
+    std::unordered_set<u64> stored_graphics;
 
     LinkedShaderCache<ChargedDxilStages> linked_shaders;
     /// Linked DXIL that dormant pipelines can drop and read back, by DXIL disk cache record:

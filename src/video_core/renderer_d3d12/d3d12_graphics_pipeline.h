@@ -75,6 +75,9 @@ struct GraphicsPipelineCacheKey {
 
     /// Refreshes the D3D12-only fields from the registers (state must be refreshed first).
     void RefreshStatic(const Maxwell& regs) noexcept;
+    /// Drops what the PSO cannot tell apart (depth bias precision, Vulkan-only hints), so draws
+    /// that differ only there share one pipeline. Also applied to keys read from the disk cache.
+    void Canonicalize() noexcept;
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_copyable_v<GraphicsPipelineCacheKey>);

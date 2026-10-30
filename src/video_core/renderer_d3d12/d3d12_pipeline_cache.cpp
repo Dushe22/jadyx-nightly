@@ -966,10 +966,19 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         size_t graphics{};   ///< Graphics pipelines read, in file order (HotPipelineSet::Prewarm).
         size_t prewarmed{};
+        size_t deferred{}; ///< Not made at boot (lazy_cold).
+        size_t folded{};   ///< Records whose canonical key an earlier record already had.
         /// Left without a PSO, by position in the file, for the background prewarm.
         std::vector<std::pair<size_t, GraphicsPipeline*>> dormant;
         bool has_loaded{};
     } state;
+
+    // Under a console's process limit, only the pipelines that get a PSO at boot are made: TOTK's
+    // 26880 cold ones cost about 2.5 KiB each as objects and ran it out of memory.
+    const u64 app_limit = device.QueryCacheMemoryPressure().app_limit;
+    const bool lazy_cold = app_limit != 0 && app_limit < (8ULL << 30);
+    stored_graphics.clear();
+    std::unordered_set<u64> loaded_keys; ///< Canonical key hashes read so far.
 
     // Each queued record holds its deserialized guest environments until a worker builds it:
     // without a window the whole file sits in the queue. Serialized record bytes stand in for
@@ -1015,10 +1024,25 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!ticket) {
             return;
         }
+        // Records written before Canonicalize existed fold into one key; the history may still
+        // name the old one.
+        const u64 stored_hash = key.Hash();
+        key.Canonicalize();
+        if (!loaded_keys.insert(key.Hash()).second) {
+            ++state.folded;
+            return;
+        }
         // Every pipeline gets its DXIL; only the hot ones a PSO, the rest when first drawn.
         const size_t file_index = state.graphics++;
-        const bool build_pso = hot_pipelines.Prewarm(key.Hash(), file_index);
+        const bool build_pso = hot_pipelines.Prewarm(key.Hash(), file_index) ||
+                               hot_pipelines.Prewarm(stored_hash, file_index);
         state.prewarmed += build_pso ? 1 : 0;
+        if (!build_pso && lazy_cold) {
+            // Made from the live shaders when first drawn; its DXIL is still in the disk cache.
+            stored_graphics.insert(key.Hash());
+            ++state.deferred;
+            return;
+        }
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, build_pso,
                            file_index, ticket = std::move(ticket)]() mutable {
@@ -1049,11 +1073,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     LOG_INFO(Render,
              "D3D12: {} pipelines in the disk cache; PSOs at boot for {} of {} graphics pipelines "
-             "({})",
-             state.total, state.prewarmed, state.graphics,
+             "({}); {} left to make when drawn, {} folded into others",
+             state.total + state.deferred + state.folded, state.prewarmed, state.graphics,
              hot_pipelines.HasHistory()
                  ? fmt::format("drawn in the last sessions, {} known", hot_pipelines.Size())
-                 : std::string("no history yet: the first ones of the cache"));
+                 : std::string("no history yet: the first ones of the cache"),
+             state.deferred, state.folded);
 
     std::unique_lock lock{state.mutex};
     callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
@@ -1465,7 +1490,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
     main_pools.ReleaseContents();
     auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), true)};
-    if (!pipeline || pipeline_cache_filename.empty()) {
+    // A cold pipeline the boot did not make is already in the file.
+    if (!pipeline || pipeline_cache_filename.empty() || stored_graphics.erase(graphics_key.Hash())) {
         return pipeline;
     }
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {

@@ -32,6 +32,7 @@
 #include "video_core/renderer_d3d12/d3d12_draw_metrics.h"
 #include "video_core/renderer_d3d12/d3d12_driver_guard.h"
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_key_canon.h"
 #include "video_core/renderer_d3d12/d3d12_log.h"
 #include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_helper.h"
@@ -222,6 +223,14 @@ void GraphicsPipelineCacheKey::RefreshStatic(const Maxwell& regs) noexcept {
                                         : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF);
     }
     emulate_reduction = 0;
+    Canonicalize();
+}
+
+void GraphicsPipelineCacheKey::Canonicalize() noexcept {
+    depth_bias = CanonicalDepthBias(depth_bias);
+    slope_scaled_depth_bias = CanonicalSlope(slope_scaled_depth_bias);
+    // A Vulkan and OpenGL hint D3D12 never reads.
+    state.app_stage.Assign(Tegra::Engines::Maxwell3D::EngineHint::None);
 }
 
 GraphicsPipeline::GraphicsPipeline(const Device& device_,
@@ -353,6 +362,12 @@ GraphicsPipeline::GraphicsPipeline(const Device& device_,
                              key.unique_hashes[1], key.unique_hashes[5]);
                 }
             }
+        }
+        // A boot pipeline left dormant whose DXIL is on disk drops it now: the GPU thread does not
+        // read dxil before Publish, and Wake reads it back. With a warm TOTK cache, ~13k dormant
+        // pipelines kept 167 MiB of DXIL that the residency sweep reached too slowly.
+        if (compiled && !build_pso && reload_dxil) {
+            dxil.reset();
         }
         FT::Mark(FT::Event::PipelineBuildDone, trace_pipeline, pipeline_state.Get() != nullptr);
         // Without a PSO yet, a pipeline whose DXIL failed is still ready: its draws are skipped.

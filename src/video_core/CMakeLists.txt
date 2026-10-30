@@ -524,6 +524,7 @@ if (ENABLE_D3D12)
         renderer_d3d12/d3d12_graphics_pipeline.h
         renderer_d3d12/d3d12_stage_bindings.cpp
         renderer_d3d12/d3d12_stage_bindings.h
+        renderer_d3d12/d3d12_key_canon.h
         renderer_d3d12/d3d12_linked_shader_cache.h
         renderer_d3d12/d3d12_live_pipeline_cache.h
         renderer_d3d12/d3d12_pso_cache.h
