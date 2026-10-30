@@ -47,7 +47,7 @@ public:
 
     /// Releases every spilled list; slots handed out before are invalid afterwards.
     void Clear() {
-        lists = {};
+        lists = decltype(lists){};
     }
 
 private:
