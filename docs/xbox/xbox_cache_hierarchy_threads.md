@@ -345,11 +345,22 @@ Mediciones (0100f2c0115b6000, App type Game, límite 5120 MiB):
 | 0.3.9.9 | DXIL de pipelines dormidos del arranque fuera | 5116 | OOM a 26,5 min; DXIL 167→36 MiB al arrancar, 87 al crashear |
 | 0.3.10.0 | pipelines frías hechas al dibujarse; GC de buffers bajo presión | 5115 | 13,6 min; 35k objetos de pipeline para 3,3k PSOs |
 | 0.3.10.1 | claves canónicas (depth bias, app_stage) | 5040 (solo en la carga) | estable 4760-4920 a los 12,6 min; 3864 objetos |
+| 0.3.10.2 | patch sites de Dynarmic en 16 B por bloque | 5017 | máx./min 4858-4953 a los 4,8 min; 3863 PSOs de arranque |
+| 0.3.10.3 | registros del perfil JIT de 32 a 24 B; `observed` sin pasarse del tope | 4993 | máx./min 4875-4891; heap vivo 548 MiB |
+| 0.3.10.4 | perfil cargado liberado tras el prewarm | 4874 | máx./min 4744-4848 a los 5,4 min; heap vivo 477 MiB |
 
-Dueños confirmados del heap: patch_information de Dynarmic (hasta 38,5 MiB/núcleo),
-grabación de perfil JIT (14 MiB/núcleo), kernel emulado (~75 MiB), fuentes (17 MiB),
-macros GPU (2 MiB c/u). PSO liberados devuelven 0 KiB de commit. Prewarm JIT no
-actuó (sin perfiles en consola).
+Dueños confirmados del heap (0.3.10.4, `memory_audit=1`): kernel emulado (3 bloques
+de ~25 MiB), fuentes (17 MiB), macros GPU (2 MiB c/u), `observed` del perfil JIT
+(9 MiB/núcleo, en su tope de 393k registros), patch_information (8 MiB/núcleo) y
+block_descriptors de Dynarmic (12 MiB/núcleo; deducido por tamaño: 32768 grupos de
+15 entradas de 24 B). PSO liberados devuelven 0 KiB de commit.
+
+Perfil JIT: en consola sí actúa (121-126k bloques y 32 MiB de código por núcleo en
+~2,9 s). `Record` heredaba de `BlockProfile` y MSVC no reusa el relleno de la base:
+32 B en vez de 24. Tras el prewarm, `loaded` (12 MiB/núcleo) se libera; `Classify`
+usa las claves del catálogo compartido (mismo orden) y una huella de 32 bits, y `Save`
+relee el archivo (verificado: 524288 descriptores guardados por núcleo al salir). Ojo:
+`vector = {}` vacía sin liberar capacidad; usar `v = decltype(v){}`.
 
 Causa principal del crecimiento: TOTK cambia la pendiente del depth bias casi en cada
 draw (1552 valores cerca de -0,5) y la clave guardaba el float exacto. En la caché del
@@ -367,11 +378,14 @@ del disco, y no se vuelven a escribir en `d3d12.bin`. El GC de buffers borra los
 llevan 20 frames sin uso cuando quedan menos de 384 MiB libres.
 
 Pendiente:
-- La primera sesión tras 0.3.10.1 preparó sólo 345 PSOs de arranque (el historial usaba
-  las claves viejas); la siguiente debería volver a 4096 y bajar los tirones.
-- Texturas: ráfaga de 1081 MiB vivas en la carga del mundo y ~200 MiB libres dentro de
-  heaps (127 en los de render targets). TOTK recrea sus render targets de resolución
-  dinámica cientos de veces (800x448 creado 883 veces): reutilizarlos es lo siguiente.
-- Después: compactar patch_information, grabar menos perfil bajo presión.
+- Tirones: 23-29 por minuto con los PSOs de arranque de vuelta (3863); se concentran en
+  el minuto 2 (PSOs hechos al primer dibujo).
+- Texturas: ráfaga de ~1100 MiB vivas en la carga del mundo y ~200 MiB libres dentro de
+  heaps, inherentes sin compactar. Reutilizar render targets no rinde: el 800x448 que
+  TOTK recrea cientos de veces ocupa 1,4 MiB.
+- Perfil JIT saturado: 400-500k bloques por núcleo descartados por el tope de
+  `observed`; no cuesta memoria, pero el perfil no aprende el resto.
+- Más chico: block_descriptors guarda puntero y tamaño de 8 B cada uno (16 B), que
+  cabrían en 8.
 
 Logs en `build-uwp/console-logs/0.3.9.*-totk-*` y `0.3.10.*-totk-*`.
