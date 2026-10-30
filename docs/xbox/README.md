@@ -30,7 +30,12 @@ en documentación histórica ya no son carpetas de entrega vigentes.
 
 ## Rendimiento y evidencia
 
+- [Cachés jerárquicas y multihilo](xbox_cache_hierarchy_threads.md): comparación actual con Cemu, catálogo offline, prewarm/precooling y protocolos separados de retiro DXIL/PSO/JIT; diseño pendiente de implementación.
+
 - [Compatibilidad de juegos](xbox_compatibility.md): selección de pruebas en consola, reportes de la comunidad y limitaciones; revisada el 28 de octubre de 2026.
+- [Fase 0 de memoria](xbox_memory_phase0.md): diagnóstico optativo de DXIL único/frío, analizador de logs y protocolo de captura; build integrado y arranque Series verificados; captura de juego pendiente.
+
+- [Viabilidad de memoria con técnicas de Cemu](xbox_memory_cemu_feasibility.md): comparación del código, DXIL descargable, admisión de prewarm, alternativas y gates propuestos; investigación del 28 de octubre de 2026, sin ahorro nuevo certificado.
 
 - [Operaciones Fermi2D](xbox_fermi2d.md): diagnóstico 0.3.4.9 para identificar operación, ROP, superficies y ruta antes de corregir efectos.
 

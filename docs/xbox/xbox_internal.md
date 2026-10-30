@@ -4289,6 +4289,182 @@ en gameplay en 0.3.8.0. Cuphead DLC tiene reporte de finalización, no certifica
 general de ausencia de fallos. Odyssey conserva clasificación y resultado previo;
 el informe separado del crash se enlaza como limitación. No se cambian etiquetas
 de Discord, código ni paquetes. Validación documental: enlaces locales y diff.
+### Investigación de memoria y Cemu UWP, 28 octubre 2026
+
+Por pedido del usuario se clona `JulianDr14/jadyx` completo en `D:\Jadyx`,
+main `06693e4a2e3ca9bd718b0f8e7832b5aaa7182a0a`. Se compara con Cemu local
+`D:\Cemu UWP`, HEAD `a21da611082ae728eac23da7589355f551c0331e`, árbol limpio.
+Informe y fuentes primarias en [xbox_memory_cemu_feasibility.md](xbox_memory_cemu_feasibility.md).
+
+Jadyx ya tiene PSO gráficos compartidos/dormidos, historial, presión app/DXGI,
+staging adaptativo y ASTC→BC3/BC1. Diferencia candidata: Cemu descarga DXIL frío
+y lo recupera de disco; Jadyx mantiene referencias en pipelines aun tras Evict.
+SetBudget(0) del LRU no elimina esos propietarios. Estudiar residencia DXIL,
+admisión del boot y pico conjunto de workers antes de portar mecanismos enteros.
+Compute queda fuera del barrido gráfico; medir peso. No habilitar GetCachedBlob
+ni bibliotecas nativas Xbox: ambos proyectos documentan device removed.
+
+README documenta carga pesada que supera cuota, heaps grandes sin atribuir y
+texturas activas: los datos son históricos, no mediciones nuevas. No prometer
+eliminar todo límite de RAM ni repetir ahorros de PSO ya incorporados.
+Prioridades posteriores: atribución C++, temporales por capas/mips y calidad
+de texturas opcional si el conjunto activo no cabe. Gate final en Series UMA,
+con mismo trayecto/cachés y picos; Job PC no equivale a consola.
+
+Baseline: MSVC C++20 /O2 compila y ejecuta PASS `memory-guard.cpp` y
+`pipeline-residency.cpp` (umbrales, staging, headroom, historial y percentiles).
+Runner en `build-uwp/diagnostics/memory-feasibility/run.cmd`. vcvars64 encontró
+MSVC pero omitió UCRT (`assert.h` ausente); se añadieron explícitamente INCLUDE
+UCRT y LIB UCRT/um del SDK 10.0.19041.0 al runner local y ambos gates pasan.
+No build del emulador, juego, paquete, commit ni push. Solo documentación.
+
+Propuesta posterior del usuario: bloques por zona/TP y carga progresiva. Diseño
+añadido al informe: conjuntos host por uso conjunto, base compartida, transición
+acotada y predictor primero en observación. No inferir geografía/LOD desde PSO;
+no omitir draws ni descartar DRAM guest. `Touch` se actualiza por uso, mientras
+`MarkDrawn` solo marca primer uso por sesión: historial actual insuficiente para
+secuencias. Gates de giro/retorno/mapa/TP, falsos cambios y pico de transición;
+sin implementación ni ahorro nuevo medido.
+
+### Fase 0 de memoria: diagnóstico, 28 octubre 2026
+
+Usuario solicita iniciar fase0. `memory_audit=1` conecta diagnóstico GPU cada5s:
+DXIL gráfico por propietario único, bytes referenciados, frío600frames cuando
+TODAS las variantes observadas están frías, Building omitidos con acquire,
+compute aparte y ledger/app/DXGI separados. Cap65536grupos, invalidación ante
+truncamiento/inconsistencia, contador scan_us sinpromesaoverheadcero. No se
+cambian políticas, cuotas ni draws. cold_upper NO acredita recarga ni bytes
+liberables (LRU/PSOkeys/fences/Building pueden retenerlos).
+
+Analizador streaming versionado separa instancias por reinicioframe y archivos;
+déficit con reserva256MiB calculado en snapshot contemporáneo, desconocido
+no implica0. Boot/heartbeat existentes resumidos aparte enMiB, sin sumarUMA.
+GateC++MSVC /O2 /W4 /WX pasa aliasactivo/coldboundary/pending/cap/inconsistencia;
+parser yCLI cubren límitesvariables/reinicio/unknown/malformed/boot/archivos.
+Runner `tools/xbox/tests/run-memory-baseline.ps1`; protocolo y comandos en
+[xbox_memory_phase0.md](xbox_memory_phase0.md).
+
+Clon sin build.ninja/dependencias preparadas: no buildintegradoUWP/APPX ni juego.
+ReglaAGENTS de operacionespesadas reserva primerconfigure/build alusuario.
+Falta gatecompilaciónintegrada, overhead y captura real Series en cargaproblemática;
+fase0abierta, no ahorro/OOMresuelto/FPS certificados. Sincommit/push.
+
+Validación final fase0: gateC++ pasa con MSVC/W4/WX; seis pruebas Python pasan,
+incluido CLIreal conarchivos UTF8BOM, salidaJSON y exit2 para logs sinmediciones.
+Tempfile(mode0700) dio AccessDenied eneste entornoWindows; fixtures ahora usan
+archivos UUID dentrodebuild-uwp/diagnostics y limpiezaindividual, sin modificarACL.
+Diagnóstico omite barrido con<=8MiBfree y captura bad_alloc deagregación como
+truncado; no se transforma en fallo de renderer. IntegraciónUWP siguependiente.
+
+### 2026-10-28 — primer build local de fase 0 autorizado por el usuario
+
+Pedido explícito de build e instalación en Xbox; reemplaza la restricción general
+sobre operaciones pesadas para esta entrega. Dependencias CPM preparadas y Ninja
+UWP generado. Mesa compilada desde fuentes 26.2.3 con los parches de este clon;
+no se reutilizó la DLL antigua de otro checkout. Exports eden v1-v4 presentes.
+
+Corrección de primer configure: OpenSSL detectaba target sin arquitectura y
+acababa en VC-WIN64A desktop. Preset fija VC-WIN64A-UWP y CMAKE_C_FLAGS con /MD
+(helper omite flags por configuración); Makefile confirma WINAPI_FAMILY_APP,
+WindowsApp y runtime /MD efectivo. Build OpenSSL local con jom /j6 y CL=/FS.
+Wrapper ignorado con PATH acotado evita fallo de detección SDK de vcvarsall.
+
+Consola detectada en 192.168.1.14:11443, Series S. Jadyx no estaba instalado;
+Cemu existente se conserva. Versión prevista del paquete diagnóstico 0.3.9.1,
+biblioteca y memory_audit=1, sin ROMs/keys/firmware. El usuario confirma que solo
+tiene el .cer público: firma local de pruebas CN=JadyxDev, thumbprint
+F5DA567D18F3A8F66AD0515A507F56472ED0789E; respaldo PFX cifrado y contraseña DPAPI
+bajo build-uwp/signing, ignorado. Respaldo descifrado y clave privada comprobados.
+No se cambia la clave oficial del actualizador ni el verificador de producción.
+Verificador local copia el de producción y fija la PEM del certificado local.
+No publicar este paquete como release oficial.
+
+Gates C++ /O2 /W4 /WX y seis tests Python pasan de nuevo. Build integrado y
+APPX/instalación siguen pendientes al momento de esta nota; no atribuir ahorro,
+mejora FPS ni OOM resuelto a los diagnósticos. No commit ni push.
+
+### 2026-10-28 — fase 0 compilada, instalada y arrancada en Series S
+
+Build integrado UWP completado, incluida Mesa 26.2.3 del clon. Se corrigieron
+C2026 del portal dividiendo el literal sin cambiar los bytes servidos y LNK2005
+de wrappers OpenSSL mediante nombres privados solo UWP, conservando FromApp.
+Gate C++ y seis tests Python pasan; sintaxis JS y vectores SHA pasan. El mock
+completo del portal falla en classList; reproducido con header/test de HEAD.
+
+APPX diagnóstico 0.3.9.1 firmado con certificado local indicado arriba:
+35 archivos y 739 bloques verificados, CMS/metadatos/payload/contenedor válidos.
+SHA256: 74C8A0A858C028DF62543262D25C4CCB37E9D26B4811361731D9BF6347303D44.
+Único paquete: build-uwp/package/jadyx.appx. Símbolos, hashes y evidencia de
+arranque archivados en build-uwp/symbols/0.3.9.1; clave privada fuera del paquete.
+
+Instalación REST Success en 192.168.1.14:11443; identidad instalada
+Jadyx_0.3.9.1_x64__s0hs1mdp2yrec. Cemu existente conservado. Usuario confirmó
+App type Game; arranque real registró 56 MiB de uso y límite 5120 MiB.
+Proceso jadyx.exe PID 4736 seguía activo tras aproximadamente un minuto.
+Boot memory_audit=1/library=1/play=1. No se cargó juego: faltan recorrido,
+teletransportes, overhead y atribución de memoria. Sin ahorro, mejora FPS ni
+resolución de OOM acreditados. Prioridad temporal de interfaz Codex restaurada
+a Normal al finalizar el build. Sin commit ni push.
+
+### 2026-10-28 — actualización integrada y build diagnóstico 0.3.9.2
+
+Usuario solicita compilar los cambios nuevos. main avanza por fast-forward de
+06693e4a2e a 52c95fae381fbc30a0aac3d13dba0850fa774b84 (71 commits).
+Cambios locales de fase 0 respaldados en stash phase0-before-update-52c95fa,
+conservado. Conflictos README/cuaderno resueltos conservando ambas entradas;
+pipeline_cache.h conserva PipelineReleaseProbe y contadores del baseline.
+No se crean commits ni se hace push. OpenSSL UWP y literal dividido del portal
+conservados; parche upstream de Xbyak aplicado por CPM correctamente.
+
+Configure UWP y build incremental de 168 tareas completos, enlace jadyx.exe
+correcto. Primera comprobación Ninja en sandbox no avanzaba; se reinició fuera
+del sandbox. Las comprobaciones de arquitectura también tardan en este equipo;
+trace confirma progreso, no atribuir toda demora al sandbox. Gates C++ baseline,
+seis tests Python, pipeline-residency (incluido release probe) y memory-guard
+pasan. No nuevo gate de juego/GPU ni medición de ahorro/FPS. Prioridad temporal
+de interfaz restaurada a Normal al terminar; receipt update-build-priority.json.
+
+APPX local 0.3.9.2 en build-uwp/package/jadyx.appx, misma clave local de pruebas,
+memory_audit=1/library=1/play=1. Verificador local con pin explícito: 35 archivos,
+743 bloques, CMS/metadatos/payload/contenedor válidos; EXE y Mesa del paquete
+idénticos al build. Mesa del clon conservada (sin cambios upstream de Mesa).
+SHA256 APPX: AF67435D96CC93126B665F0D492B2F765F9A43014AD2F1C2DED2F0B405736067.
+SHA256 EXE: BDC650B6598D547C2D1F412E523B78C98DF3C4C312EE1FD60849469EFC78F48C.
+Símbolos, hashes, metadata y logs en build-uwp/symbols/0.3.9.2.
+Esta entrega solo se compiló y empaquetó: instalación y arranque de 0.3.9.2
+pendientes; Xbox conserva 0.3.9.1. No publicar como release oficial.
+### 2026-10-28 — instalación de 0.3.9.2 solicitada
+
+APPX hash AF67435D96CC93126B665F0D492B2F765F9A43014AD2F1C2DED2F0B405736067
+comprobado antes del upload. Device Portal 192.168.1.14 devuelve Success/Code0;
+identidad Jadyx_0.3.9.2_x64__s0hs1mdp2yrec confirmada. Arranque por AUMID y
+proceso activo PID4636 verificados. Diagnóstico append conserva sesión anterior:
+la última sesión, identificable por peak private commit nuevo, marca 1024 MiB.
+La actualización restableció App type a App: se pide cambiar de nuevo a Game
+en DevHome. No atribuirle 5120 MiB por el log de 0.3.9.1 anterior. Pendiente
+confirmación del usuario y nuevo arranque para verificar límite. Logs/identidad/
+procesos archivados en symbols/0.3.9.2. No juego ni estabilidad certificada.
+Confirmación posterior: usuario marcó Game. POST de arranque abre sesión nueva;
+log nuevo con peak private commit confirma 56 MiB de uso y límite 5120 MiB.
+Proceso 0.3.9.2 activo comprobado. DELETE previo con appid fue rechazado porque
+requiere package; no fue necesario reintentarlo: el nuevo arranque se verifica
+por la sesión y el límite real. Evidencias boot-xbox-game-diag.txt y procesos
+archivadas en symbols/0.3.9.2. Instalación y arranque cerrados; juego pendiente.
+
+### 2026-10-28 — investigación de jerarquías, prewarm y JIT
+
+Comparados Jadyx 52c95fae381f y Cemu local a21da611082a, sin modificar Cemu.
+Diseño y evidencias en [cachés jerárquicas y multihilo](xbox_cache_hierarchy_threads.md).
+Cemu aporta DXIL recargable, niveles por sesiones y límite compartido de
+compilación; su eliminación de funciones PPC conserva pendiente liberar x86.
+El doble mapeo de su backend está deshabilitado y la segunda etapa de recording
+S2d sigue pendiente. Jadyx ya dispone de prewarm JIT paralelo por propietario
+detenido; sus chunks no ofrecen expulsión parcial durante ejecución.
+Propuesto catálogo offline de solo lectura, luego DXIL descargable con cola
+acotada y finalmente segmentos JIT con protocolo propio de retiro. Identificar
+registros existentes sin ejecutar es viable; deducir todas las variantes o zonas
+sin datos previos no. Solo documentación: sin cambios de runtime ni mediciones
+nuevas de ahorro. Gameplay y validación de rendimiento siguen pendientes.
 
 Cachés jerárquicas 28oct2026 (detalle en xbox_cache_hierarchy_threads.md):
 inspector offline `tools/xbox/inspect-caches.py` (DXIL JDXC/perfiles JIT, solo
