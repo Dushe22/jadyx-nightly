@@ -909,6 +909,7 @@ ID3D12Resource* Image::SliceArray() {
     D3D12_RESOURCE_DESC desc = resource->GetDesc();
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.Alignment = 0; // the source may be placed at 4 KiB; committed ones take the default
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     ThrowIfFailed(runtime->device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&slice_array)),
@@ -936,6 +937,7 @@ ID3D12Resource* Image::Volume() {
     }
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.Alignment = 0; // copied from a resource that may be placed at 4 KiB
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     ThrowIfFailed(runtime->device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&volume)),
@@ -980,6 +982,7 @@ ID3D12Resource* Image::Cube() {
     }
     desc.DepthOrArraySize = 6;
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.Alignment = 0; // copied from a resource that may be placed at 4 KiB
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     ThrowIfFailed(runtime->device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&cube)),
@@ -1037,6 +1040,7 @@ ID3D12Resource* Image::Reinterpreted(DXGI_FORMAT family) {
     }
     desc.Format = family;
     desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    desc.Alignment = 0; // copied from a resource that may be placed at 4 KiB
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     ThrowIfFailed(runtime->device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                   D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&reinterpreted)),

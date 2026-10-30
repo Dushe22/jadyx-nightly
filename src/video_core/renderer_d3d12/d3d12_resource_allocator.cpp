@@ -117,6 +117,8 @@ struct TextureResourceAllocator::State {
     u64 rt_misses_with_room{};
     u64 rt_miss_largest{};
     u64 rt_spills{}; // small render targets placed in large RT heaps
+    u64 small_placed{};     // textures placed at 4 KiB alignment
+    u64 small_saved_live{}; // what that alignment saves on the live ones
 
     // Accessed only by the recording thread, never by retirement callbacks.
     u64 pressure_wait_tick{};
@@ -168,9 +170,14 @@ struct TextureResourceAllocator::Allocation {
     u64 size{};
     bool pending{}; // guarded by State::mutex
     State::CensusEntry* census{};
+    u64 small_saved{}; ///< bytes 4 KiB alignment saved over 64 KiB
 
     ~Allocation() {
         if (state) {
+            if (small_saved) {
+                std::scoped_lock lock{state->mutex};
+                state->small_saved_live -= small_saved;
+            }
             state->Free(block_index, offset, size, pending, census);
         }
     }
@@ -182,11 +189,29 @@ TextureResourceAllocator::TextureResourceAllocator(const Device& device_, Schedu
 TextureResourceAllocator::~TextureResourceAllocator() = default;
 
 TextureResourceAllocator::Resource TextureResourceAllocator::Create(
-    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
+    const D3D12_RESOURCE_DESC& requested_desc, D3D12_RESOURCE_STATES initial_state,
     const D3D12_CLEAR_VALUE* clear_value) {
-    const D3D12_RESOURCE_ALLOCATION_INFO info = device.Get()->GetResourceAllocationInfo(0, 1, &desc);
+    D3D12_RESOURCE_DESC desc = requested_desc;
+    D3D12_RESOURCE_ALLOCATION_INFO info = device.Get()->GetResourceAllocationInfo(0, 1, &desc);
     if (info.SizeInBytes == UINT64_MAX || info.Alignment == 0) {
         return {};
+    }
+    // A placed texture whose most detailed mip fits 64 KiB may take 4 KiB alignment: at the
+    // default 64 KiB an 8 KiB texture took 64. The runtime says whether this one qualifies.
+    u64 small_saved = 0;
+    if (desc.Alignment == 0 && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        desc.SampleDesc.Count == 1 && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+        (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0) {
+        D3D12_RESOURCE_DESC small_desc = desc;
+        small_desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+        const auto small_info = device.Get()->GetResourceAllocationInfo(0, 1, &small_desc);
+        if (small_info.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
+            small_info.SizeInBytes < info.SizeInBytes) {
+            small_saved = info.SizeInBytes - small_info.SizeInBytes;
+            desc = small_desc;
+            info = small_info;
+        }
     }
     const HeapClass heap_class = ClassOf(desc, info.SizeInBytes);
     const u64 heap_alignment =
@@ -398,9 +423,14 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             result.allocation->block_index = selected;
             result.allocation->offset = selected_offset;
             result.allocation->size = info.SizeInBytes;
+            result.allocation->small_saved = small_saved;
             result.placed = true;
             std::scoped_lock lock{state->mutex};
             ++state->placed_resources;
+            if (small_saved) {
+                ++state->small_placed;
+                state->small_saved_live += small_saved;
+            }
             auto& entry = state->census[{static_cast<u32>(desc.Format), desc.Width, desc.Height,
                                          desc.DepthOrArraySize, desc.MipLevels,
                                          static_cast<u32>(desc.Flags)}];
@@ -417,7 +447,8 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
 
     const D3D12_HEAP_PROPERTIES heap{.Type = D3D12_HEAP_TYPE_DEFAULT};
     const auto create_committed = [&] {
-        return device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        // Committed resources keep the default alignment.
+        return device.Get()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &requested_desc,
                                                       initial_state, clear_value,
                                                       IID_PPV_ARGS(&result.resource));
     };
@@ -538,12 +569,13 @@ std::string TextureResourceAllocator::Report() const {
              state->rt_spills);
     return fmt::format("texture heaps {} MiB, live {} MiB, peak {} MiB, placed {}, fallback {}, trimmed {} ({} MiB), "
                        "growth recoveries {}, pressure waits {}, pressure heaps {}, "
-                       "avoided capacity {} MiB",
+                       "avoided capacity {} MiB, 4 KiB aligned {} saving {} MiB live",
                        state->heap_bytes / 1_MiB, state->live_bytes / 1_MiB,
                        state->peak_bytes / 1_MiB, state->placed_resources,
                        state->committed_fallbacks, state->trimmed_heaps, state->trimmed_bytes / 1_MiB,
                        state->growth_recoveries, state->pressure_waits, state->compact_heaps,
-                       state->avoided_capacity / 1_MiB);
+                       state->avoided_capacity / 1_MiB, state->small_placed,
+                       state->small_saved_live / 1_MiB);
 }
 
 std::string TextureResourceAllocator::Census(size_t top) const {
