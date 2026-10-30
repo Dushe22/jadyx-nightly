@@ -295,6 +295,10 @@ u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
 u64 BufferCacheRuntime::GetDeviceMemoryUsage() const {
     return device.CacheMemoryUsage();
 }
+bool BufferCacheRuntime::BufferGcEmergency() const {
+    const CacheMemorySnapshot snapshot = device.QueryCacheMemoryPressure();
+    return snapshot.app_limit != 0 && snapshot.AppFree() <= 384ULL * 1024 * 1024;
+}
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) { return staging.Request(size, MemoryUsage::Upload); }
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) { return staging.Request(size, MemoryUsage::Download, deferred); }
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) { staging.FreeDeferred(ref); }

@@ -125,6 +125,8 @@ public:
     u64 GetDeviceLocalMemory() const;
     u64 GetDeviceMemoryUsage() const;
     bool CanReportMemoryUsage() const { return true; }
+    /// Under 384 MiB of app headroom (Critical): TOTK held 199 MiB of buffers when it ran out.
+    bool BufferGcEmergency() const;
     u32 GetUniformBufferAlignment() const { return D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT; }
     u32 GetStorageBufferAlignment() const { return 16; }
 

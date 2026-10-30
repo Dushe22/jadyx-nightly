@@ -61,8 +61,15 @@ void BufferCache<P>::RunGarbageCollector() {
     const VideoCore::Perf::ScopedTimer gc_timer{VideoCore::Perf::Counter::CacheGcUs,
                                                 VideoCore::Perf::Counter::CacheGcRuns};
     const bool aggressive_gc = total_used_memory >= critical_memory;
-    const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
+    u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
     int num_iterations = aggressive_gc ? 64 : 32;
+    if constexpr (requires { runtime.BufferGcEmergency(); }) {
+        // A backend close to its process limit takes buffers idle for far fewer frames.
+        if (runtime.BufferGcEmergency()) {
+            ticks_to_destroy = 20;
+            num_iterations = 64;
+        }
+    }
     const auto clean_up = [this, &num_iterations](BufferId buffer_id) {
         if (num_iterations == 0) {
             return true;
