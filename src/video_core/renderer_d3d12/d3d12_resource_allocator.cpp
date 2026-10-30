@@ -95,6 +95,7 @@ struct TextureResourceAllocator::State {
         std::map<u64, u64> free_ranges; // offset -> bytes
         Common::MemoryCharge charge;
         u64 empty_tick{}; // first trim pass that saw it empty; 0 while in use
+        u32 live{};       // placed resources in it, for the RT occupancy report
     };
 
     mutable std::mutex mutex;
@@ -111,6 +112,12 @@ struct TextureResourceAllocator::State {
     u64 compact_heaps{};
     u64 avoided_capacity{};
     u64 pressure_waits{};
+    // RT/DS requests no heap of their class could hold, and those whose class had that much free.
+    u64 rt_misses{};
+    u64 rt_misses_with_room{};
+    u64 rt_miss_largest{};
+    u64 rt_spills{}; // small render targets placed in large RT heaps
+
     // Accessed only by the recording thread, never by retirement callbacks.
     u64 pressure_wait_tick{};
     // Diagnostic census of placed resources by shape (format, width, height, depth, mips, flags).
@@ -130,6 +137,7 @@ struct TextureResourceAllocator::State {
         if (block_index >= blocks.size()) {
             return;
         }
+        if (blocks[block_index].live) --blocks[block_index].live;
         const u64 released_size = size;
         auto& ranges = blocks[block_index].free_ranges;
         auto next = ranges.lower_bound(offset);
@@ -202,20 +210,23 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             ranges.emplace(end, range_offset + range_size - end);
         }
         state->blocks[selected].empty_tick = 0;
+        ++state->blocks[selected].live;
         state->live_bytes += info.SizeInBytes;
         state->peak_bytes = std::max(state->peak_bytes, state->live_bytes);
     };
 
-    const auto find_space = [&] {
+    // spill: let a small render target use the large RT heaps' free space.
+    const auto find_space = [&](bool spill) {
         std::scoped_lock lock{state->mutex};
         // The fullest heap that fits, then the tightest range in it: resolution-scaled render
         // targets are recreated every few frames, and choosing the tightest range across all heaps
         // kept a few live resources in every heap (912 MiB of heaps for 487 MiB live), so none
         // emptied and the texture cap could not release any. Packing the dense heaps first lets
         // the sparse ones drain.
-        // A small render target with no room in its own heaps takes free space in the large RT
-        // heaps before growing: under pressure, splitting them off made 489 tiny heaps while
-        // ~250 MiB sat free in RT heaps.
+        // A small render target spills into the large RT heaps only when growing its own would
+        // exhaust the budget: spilled ones kept TOTK's 32 MiB RT heaps from emptying (3-6 live,
+        // 29-31 MiB free each, ~130 MiB). Before 8 MiB small heaps, splitting them off made 489
+        // tiny heaps while ~250 MiB sat free in RT heaps.
         const auto search = [&](HeapClass wanted_class) {
             for (size_t index = 0; index < state->blocks.size(); ++index) {
                 auto& block = state->blocks[index];
@@ -240,13 +251,25 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
             }
         };
         search(heap_class);
-        if (selected == SIZE_MAX && heap_class == HeapClass::SmallRenderTarget) {
+        if (spill && selected == SIZE_MAX && heap_class == HeapClass::SmallRenderTarget) {
             search(HeapClass::RenderTarget);
+            if (selected != SIZE_MAX) ++state->rt_spills;
         }
         // Reserve while still holding the pool lock so a concurrent trim cannot remove it.
         if (selected != SIZE_MAX) reserve_space();
     };
-    find_space();
+    find_space(false);
+    if (selected == SIZE_MAX && heap_class != HeapClass::Texture) {
+        std::scoped_lock lock{state->mutex};
+        u64 class_free = 0;
+        for (const auto& block : state->blocks) {
+            if (!block.heap || block.heap_class != heap_class) continue;
+            for (const auto& range : block.free_ranges) class_free += range.second;
+        }
+        ++state->rt_misses;
+        if (class_free >= info.SizeInBytes) ++state->rt_misses_with_room;
+        state->rt_miss_largest = std::max(state->rt_miss_largest, info.SizeInBytes);
+    }
 
     bool compact = false;
     u64 wanted{};
@@ -265,12 +288,15 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
         const bool pressure = pressured(before);
         const auto old_stats = GetStats();
         scheduler.CollectGarbage();
-        find_space();
+        find_space(false);
         // Waiting stalled the GPU thread on most pressured misses. Only wait when even an exact
         // heap would exhaust the budget and retiring work could return enough to hold this one.
         const bool exhausted = HeapGrowth::Exhausted(
             HeapGrowth::Capacity(info.SizeInBytes, info.Alignment, true),
             {before.app_used, before.app_limit});
+        if (selected == SIZE_MAX && exhausted) {
+            find_space(true);
+        }
         if (selected == SIZE_MAX && pressure && exhausted && scheduler.IsRecordingThread() &&
             GetStats().pending_bytes >= info.SizeInBytes) {
             const u64 current = scheduler.CurrentTick();
@@ -283,7 +309,7 @@ TextureResourceAllocator::Resource TextureResourceAllocator::Create(
                 }
                 scheduler.Wait(previous);
                 scheduler.CollectGarbage();
-                find_space();
+                find_space(true);
             }
         }
         TrimEmptyHeaps(pressure ? TrimMode::Settled : TrimMode::KeepWarm);
@@ -484,6 +510,32 @@ std::string TextureResourceAllocator::Report() const {
              count[0], free[0] / 1_MiB, empty[0] / 1_MiB, largest[0] / 1_MiB, count[1],
              free[1] / 1_MiB, empty[1] / 1_MiB, largest[1] / 1_MiB, count[2], free[2] / 1_MiB,
              empty[2] / 1_MiB, largest[2] / 1_MiB, state->pending_bytes / 1_MiB);
+    // Which RT/DS heaps hold free space, and how few resources keep each one from emptying.
+    std::vector<const State::Block*> rt_blocks;
+    for (const auto& block : state->blocks) {
+        if (block.heap && block.heap_class == HeapClass::RenderTarget) rt_blocks.push_back(&block);
+    }
+    const auto free_of = [](const State::Block* block) {
+        u64 bytes = 0;
+        for (const auto& range : block->free_ranges) bytes += range.second;
+        return bytes;
+    };
+    std::sort(rt_blocks.begin(), rt_blocks.end(),
+              [&](const auto* a, const auto* b) { return free_of(a) > free_of(b); });
+    std::string rt_heaps;
+    for (size_t i = 0; i < std::min<size_t>(8, rt_blocks.size()); ++i) {
+        u64 largest_range = 0;
+        for (const auto& range : rt_blocks[i]->free_ranges) {
+            largest_range = std::max(largest_range, range.second);
+        }
+        rt_heaps += fmt::format(" [{} MiB: {} live, {} free, max {}]", rt_blocks[i]->size / 1_MiB,
+                                rt_blocks[i]->live, free_of(rt_blocks[i]) / 1_MiB,
+                                largest_range / 1_MiB);
+    }
+    LOG_INFO(Render, "D3D12: RT heaps by free space:{} | RT/DS misses {}, {} with room in the "
+             "class, largest request {} KiB; small RT spills {}",
+             rt_heaps, state->rt_misses, state->rt_misses_with_room, state->rt_miss_largest >> 10,
+             state->rt_spills);
     return fmt::format("texture heaps {} MiB, live {} MiB, peak {} MiB, placed {}, fallback {}, trimmed {} ({} MiB), "
                        "growth recoveries {}, pressure waits {}, pressure heaps {}, "
                        "avoided capacity {} MiB",
