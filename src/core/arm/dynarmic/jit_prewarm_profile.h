@@ -53,14 +53,32 @@ constexpr std::uint64_t CodeStart(std::uint64_t pc) {
     return pc & ~std::uint64_t{3};
 }
 
-struct Record : Dynarmic::BlockProfile {
+/// BlockProfile's fields plus the gameplay samples in its tail padding: deriving from it took
+/// 32 bytes (MSVC does not reuse a base's padding), 16 MiB of loaded records a core.
+struct Record {
+    static constexpr std::uint32_t MaxCodeBytes = Dynarmic::BlockProfile::MaxCodeBytes;
+    static constexpr std::uint64_t HashSeed = Dynarmic::BlockProfile::HashSeed;
+
+    std::uint64_t descriptor{};
+    std::uint64_t code_hash{HashSeed};
+    std::uint32_t code_bytes{};
     std::uint32_t gameplay_samples{};
+
     Record() = default;
     Record(std::uint64_t descriptor_, std::uint64_t hash_, std::uint32_t bytes_,
            std::uint32_t samples = 0)
-        : Dynarmic::BlockProfile{descriptor_, hash_, bytes_}, gameplay_samples{samples} {}
-    explicit Record(const Dynarmic::BlockProfile& block) : Dynarmic::BlockProfile{block} {}
+        : descriptor{descriptor_}, code_hash{hash_}, code_bytes{bytes_}, gameplay_samples{samples} {}
+    explicit Record(const Dynarmic::BlockProfile& block)
+        : descriptor{block.descriptor}, code_hash{block.code_hash}, code_bytes{block.code_bytes} {}
+    operator Dynarmic::BlockProfile() const {
+        Dynarmic::BlockProfile block{};
+        block.descriptor = descriptor;
+        block.code_hash = code_hash;
+        block.code_bytes = code_bytes;
+        return block;
+    }
 };
+static_assert(sizeof(Record) == 24);
 using BuildId = std::array<std::uint8_t, 32>;
 // A large game compiles 330-440k distinct blocks per core by the time it reaches its world:
 // 262144 filled up and dropped the rest for good, which were then compiled during the load.
@@ -416,6 +434,10 @@ struct Profile {
         if (destination.size() == capacity) {
             ++dropped;
             return;
+        }
+        // Grow by half, but never past the cap: 1.5x of 311k records overshot it by 73k.
+        if (destination.size() == destination.capacity()) {
+            destination.reserve(std::min(capacity, destination.size() + destination.size() / 2 + 16));
         }
         destination.push_back(relative);
     }
