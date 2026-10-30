@@ -24,6 +24,7 @@
 #include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/mcl/bit.hpp"
 #include "dynarmic/backend/exception_handler.h"
+#include "dynarmic/backend/x64/patch_sites.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/ir/location_descriptor.h"
@@ -117,24 +118,9 @@ public:
 
     // Patching
     enum class PatchKind : std::uint64_t { Jg, Jz, Jmp, MovRcx };
-    /// A site in emitted code that jumps to (or loads) a block's entrypoint, with its kind in the
-    /// top bits of the address (user-mode x64 addresses fit in 48 bits). One map entry per linked
-    /// block: four lists of four inline pointers cost ~230 bytes each, 3 x 109 MiB in a large game.
-    class PatchSite {
-    public:
-        PatchSite(PatchKind kind, CodePtr location) noexcept
-            : bits{reinterpret_cast<std::uint64_t>(location) | (static_cast<std::uint64_t>(kind) << KIND_SHIFT)} {}
-        [[nodiscard]] PatchKind Kind() const noexcept { return static_cast<PatchKind>(bits >> KIND_SHIFT); }
-        [[nodiscard]] CodePtr Location() const noexcept {
-            return reinterpret_cast<CodePtr>(bits & ((std::uint64_t{1} << KIND_SHIFT) - 1));
-        }
-
-    private:
-        static constexpr unsigned KIND_SHIFT = 62;
-        std::uint64_t bits;
-    };
-    /// Most blocks are linked from one site, so one is inline.
-    using PatchInformation = boost::container::small_vector<PatchSite, 1>;
+    // One map entry per linked block. Four lists of four inline pointers cost ~230 bytes each
+    // (3 x 109 MiB in a large game); a small_vector of one site, 40 with the key (38.5 MiB a core
+    // in TOTK); a PatchSiteLists slot, 16.
     void AddPatchSite(const IR::LocationDescriptor& target_desc, PatchKind kind);
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     virtual void Unpatch(const IR::LocationDescriptor& target_desc);
@@ -147,7 +133,8 @@ public:
     BlockOfCode& code;
     ExceptionHandler exception_handler;
     ::Common::unordered_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
-    ::Common::unordered_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    ::Common::unordered_map<IR::LocationDescriptor, PatchSiteLists::Slot> patch_information;
+    PatchSiteLists patch_lists;
 
     // We need materialized protected members
     friend class A64EmitX64;

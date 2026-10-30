@@ -157,6 +157,7 @@ if ("x86_64" IN_LIST ARCHITECTURE)
         backend/x64/devirtualize.h
         backend/x64/emit_x64.cpp
         backend/x64/emit_x64.h
+        backend/x64/patch_sites.h
         backend/x64/emit_x64_aes.cpp
         backend/x64/emit_x64_crc32.cpp
         backend/x64/emit_x64_data_processing.cpp

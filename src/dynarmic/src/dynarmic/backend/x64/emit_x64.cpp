@@ -372,14 +372,14 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         return; // No incoming links: do not allocate four empty patch lists for this block.
     }
     const CodePtr save_code_ptr = code.getCurr();
-    const PatchInformation& patch_info = it->second;
     // Patch sites are in blocks already emitted, so behind the write window (paged W^X).
     constexpr size_t MAX_PATCH_SIZE = 32;
 
-    for (const PatchSite site : patch_info) {
-        code.MakeWritable(site.Location(), MAX_PATCH_SIZE);
-        code.SetCodePtr(site.Location());
-        switch (site.Kind()) {
+    patch_lists.ForEach(it->second, [&](unsigned kind, std::uint64_t location) {
+        const auto site = reinterpret_cast<CodePtr>(location);
+        code.MakeWritable(site, MAX_PATCH_SIZE);
+        code.SetCodePtr(site);
+        switch (static_cast<PatchKind>(kind)) {
         case PatchKind::Jg:
             EmitPatchJg(target_desc, target_code_ptr);
             break;
@@ -393,13 +393,14 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
             EmitPatchMovRcx(target_code_ptr);
             break;
         }
-    }
+    });
 
     code.SetCodePtr(save_code_ptr);
 }
 
 void EmitX64::AddPatchSite(const IR::LocationDescriptor& target_desc, PatchKind kind) {
-    patch_information[target_desc].emplace_back(kind, code.getCurr());
+    patch_lists.Add(patch_information[target_desc], static_cast<unsigned>(kind),
+                    reinterpret_cast<std::uint64_t>(code.getCurr()));
 }
 
 void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
@@ -411,6 +412,7 @@ void EmitX64::ClearCache() {
     // compiled a large game, which a clear to give memory back would not return.
     block_descriptors = decltype(block_descriptors){};
     patch_information = decltype(patch_information){};
+    patch_lists.Clear();
 
     PerfMapClear();
 }
