@@ -79,6 +79,8 @@ std::atomic_bool s_code_cache_release{false};
 /// What a capped cache may still emit past the pages it had committed: one block's worth
 /// (MINIMUM_REMAINING_CODESIZE) and its commit ahead, so it is not cleared on the spot.
 constexpr size_t CAP_SLACK = 2 * 1024 * 1024;
+/// A releasing cap clears a cache only past this much over the cap (CapEnd).
+constexpr size_t RELEASE_MIN_GAIN = 16 * 1024 * 1024;
 /// SetDualMappedCode, and how many code caches live dual-mapped (DualMappedCodeCaches).
 std::atomic_bool s_dual_map_allowed{true};
 std::atomic<size_t> s_dual_mapped_caches{0};
@@ -841,7 +843,13 @@ size_t BlockOfCode::CapEnd(size_t cap) const {
     if (cap == SIZE_MAX) {
         return SIZE_MAX;
     }
-    return s_code_cache_release.load(std::memory_order_relaxed) ? cap : std::max(cap, committed + CAP_SLACK);
+    // A releasing cap clears only the caches it would get real memory back from. TOTK's caches
+    // held ~102 MiB under a 96 MiB cap: clearing them gave back 6 MiB each and recompiled every
+    // hot block, then again whenever they refilled. Within the margin they just stop growing.
+    if (s_code_cache_release.load(std::memory_order_relaxed) && committed > cap + RELEASE_MIN_GAIN) {
+        return cap;
+    }
+    return std::max(cap, committed + CAP_SLACK);
 }
 
 size_t BlockOfCode::SpaceRemaining() const {
