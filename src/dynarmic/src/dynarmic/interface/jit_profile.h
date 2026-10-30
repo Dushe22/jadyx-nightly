@@ -36,6 +36,8 @@ inline std::array<Counters, static_cast<std::size_t>(Phase::Count)> counters;
 inline std::atomic_bool enabled{};
 /// Code caches emptied because they filled up, all their blocks dropped with them. Always counted.
 inline std::atomic<std::uint64_t> full_cache_clears{};
+/// Blocks compiled ahead as static successors of a new block (paged W^X). Always counted.
+inline std::atomic<std::uint64_t> speculative_blocks{};
 
 /// Bytes of emitted A64 code by part of the block, to see what fills the code caches. Counted
 /// only with profiling on; the memory part is the guest loads and stores emitted inline.

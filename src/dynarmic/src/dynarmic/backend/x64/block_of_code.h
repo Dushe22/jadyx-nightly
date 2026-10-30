@@ -59,6 +59,8 @@ public:
     /// protection change per block. Nothing in the window can run until EndWriteBatch.
     void BeginWriteBatch();
     void EndWriteBatch();
+    /// True when every write window costs page protection changes (paged W^X, not dual-mapped).
+    bool PagedWriteProtection() const;
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();

@@ -783,6 +783,14 @@ void BlockOfCode::EndWriteBatch() {
     DisableWriting();
 }
 
+bool BlockOfCode::PagedWriteProtection() const {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    return !dual_mapped;
+#else
+    return false;
+#endif
+}
+
 void BlockOfCode::MakeWritable([[maybe_unused]] CodePtr where, [[maybe_unused]] size_t size) {
 #if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
     if (!prelude_complete || !wx_writing || dual_mapped) {

@@ -251,7 +251,49 @@ private:
             return nullptr;
         if (auto block = existing; block && !expected)
             return block->entrypoint;
+        if (expected || !block_of_code.PagedWriteProtection())
+            return CompileBlock(descriptor, expected, false);
 
+        // Paged W^X: a write window costs two protection changes, most of a block's compile.
+        // Compile the block's static successors in the same window, before they are reached.
+        block_of_code.BeginWriteBatch();
+        struct EndBatch {
+            BlockOfCode& code;
+            ~EndBatch() { code.EndWriteBatch(); }
+        } end_batch{block_of_code};
+        const CodePtr entrypoint = CompileBlock(descriptor, nullptr, false);
+        std::array<IR::LocationDescriptor, 2> next{descriptor, descriptor};
+        size_t count = 0;
+        const auto leaf = [&](const IR::Term::LeafTerminal& term) {
+            if (const auto* link = std::get_if<IR::Term::LinkBlock>(&term); link && count < next.size())
+                next[count++] = link->next;
+            else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&term); fast && count < next.size())
+                next[count++] = fast->next;
+        };
+        const auto terminal = ir_block.GetTerminal();
+        if (const auto* term = std::get_if<IR::Term::LeafTerminal>(&terminal)) {
+            leaf(*term);
+        } else if (const auto* cond = std::get_if<IR::Term::If>(&terminal)) {
+            leaf(cond->then_);
+            leaf(cond->else_);
+        } else if (const auto* bit = std::get_if<IR::Term::CheckBit>(&terminal)) {
+            leaf(bit->then_);
+            leaf(bit->else_);
+        } else if (const auto* halt = std::get_if<IR::Term::CheckHalt>(&terminal)) {
+            leaf(halt->else_);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            // Room to spare: a full clear here would drop the block just compiled.
+            if (emitter.GetBasicBlock(next[i]) || block_of_code.SpaceRemaining() < 4 * 1024 * 1024)
+                continue;
+            if (CompileBlock(next[i], nullptr, true))
+                JitProfile::speculative_blocks.fetch_add(1, std::memory_order_relaxed);
+        }
+        return entrypoint;
+    }
+
+    /// speculative: compiled ahead of execution; skipped when any of its guest code is unmapped.
+    CodePtr CompileBlock(IR::LocationDescriptor descriptor, const BlockProfile* expected, bool speculative) {
         const JitProfile::Timer compile_timer{JitProfile::Phase::Compile};
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
@@ -266,12 +308,14 @@ private:
         BlockProfile profile{descriptor.Value()};
         const bool capture = expected || bool(block_profile_callback);
         bool valid_profile = true;
+        bool code_missing = false;
         const auto get_code = [&](u64 vaddr) -> std::optional<u32> {
             if (expected && profile.code_bytes >= expected->code_bytes) {
                 valid_profile = false;
                 return std::nullopt;
             }
             const auto word = conf.callbacks->MemoryReadCode(vaddr);
+            code_missing |= !word;
             if (capture) {
                 if (!word || profile.code_bytes >= BlockProfile::MaxCodeBytes) {
                     valid_profile = false;
@@ -290,6 +334,9 @@ private:
         }
         if (expected && (!valid_profile || profile.code_bytes != expected->code_bytes ||
                          profile.code_hash != expected->code_hash)) {
+            return nullptr;
+        }
+        if (speculative && code_missing) {
             return nullptr;
         }
         {
