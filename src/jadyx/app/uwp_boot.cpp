@@ -172,6 +172,7 @@ void SetCloseProbeEnabled(bool enabled);     // d3d12_device.h
 void SetPipelineEviction(bool enabled);      // d3d12_pipeline_cache.h
 void SetDxilRelease(bool enabled);           // d3d12_pipeline_cache.h
 void SetPipelinePrewarm(bool enabled);       // d3d12_pipeline_cache.h
+void SetPipelineWorkers(size_t count);       // d3d12_pipeline_cache.h
 void SetComputeWorkgroupSplit(u32 factor);   // d3d12_pipeline_cache.h
 void SetTransformFeedbackStorage(bool enabled); // d3d12_pipeline_cache.h
 void SetDescriptorRemovalChecks(bool enabled); // d3d12_device.h
@@ -336,6 +337,9 @@ struct BootConfig {
     /// Build dormant PSOs in the background while memory is plentiful ("pso_prewarm=0" leaves
     /// them to their first draw).
     bool pso_prewarm{true};
+    /// Pipeline builder threads ("pso_workers=1..8"), 0 for the default: for timing the boot's
+    /// pipeline loading and its memory peak at 1, 2 or 4.
+    u32 pso_workers{};
     /// Transform feedback through vertex shader storage writes instead of stream output
     /// ("xfb=storage"): the fallback, for A/B comparison.
     bool xfb_storage{};
@@ -669,6 +673,7 @@ int RunHeadlessBoot(const std::string& launch_path, const BootSurface& surface,
     D3D12::SetPipelineEviction(config.pso_eviction);
     D3D12::SetDxilRelease(config.dxil_release);
     D3D12::SetPipelinePrewarm(config.pso_prewarm);
+    D3D12::SetPipelineWorkers(config.pso_workers);
     D3D12::SetTransformFeedbackStorage(config.xfb_storage);
     Tegra::SetIndirectMacroCpuRead(config.indirect_macro_cpu);
     VideoCommon::force_occlusion_visible.store(config.occlusion_force_visible,
@@ -2943,6 +2948,14 @@ struct BootView : implements<BootView, IFrameworkViewSource, IFrameworkView> {
                     for (std::string line; std::getline(cfg, line);) {
                         constexpr std::string_view key = "run_seconds=";
                         constexpr std::string_view hunt_at_key = "hunt_at=";
+                        // Outside the else-if chain below: it is at MSVC's nesting limit.
+                        if (line.starts_with("pso_workers=")) {
+                            config.pso_workers = std::clamp<u32>(
+                                static_cast<u32>(std::strtoul(line.c_str() + 12, nullptr, 10)), 1, 8);
+                            WriteDiag("boot.cfg: " + std::to_string(config.pso_workers) +
+                                      " pipeline builder threads");
+                            continue;
+                        }
                         if (line.starts_with(hunt_at_key)) {
                             config.hunt_at = static_cast<u32>(
                                 std::strtoul(line.c_str() + hunt_at_key.size(), nullptr, 10));

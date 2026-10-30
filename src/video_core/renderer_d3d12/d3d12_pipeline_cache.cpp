@@ -83,6 +83,7 @@ bool HasShaderHash(const std::array<std::atomic<u64>, 4>& slots, u64 unique_hash
 std::atomic_bool pipeline_eviction{true};
 std::atomic_bool dxil_release{};
 std::atomic_bool pipeline_prewarm{true};
+std::atomic<size_t> pipeline_workers{}; ///< 0: the default.
 // EXPERIMENTAL default: 16 is only measured in one game so far, where it took a persistent compute
 // dispatch from ~82 ms to ~4.5 ms per frame on Series. If another game shows broken compute
 // results (particles, physics, culling) or hangs, try boot.cfg "cs_split=1" first.
@@ -344,6 +345,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 /// Pipeline workers. Capped: each one holds a recompiler and a translator's worth of memory, and
 /// the console's game partition has 5 GB in total.
 size_t GetTotalPipelineWorkers() {
+    if (const size_t count = pipeline_workers.load(std::memory_order_relaxed); count != 0) {
+        return count;
+    }
     const size_t threads = std::max<size_t>(std::thread::hardware_concurrency(), 2) - 1;
     return std::min<size_t>(threads, 4);
 }
@@ -485,6 +489,10 @@ bool PipelineCache::NativeStreamOutput() const {
 
 void SetPipelinePrewarm(bool enabled) {
     pipeline_prewarm.store(enabled, std::memory_order_relaxed);
+}
+
+void SetPipelineWorkers(size_t count) {
+    pipeline_workers.store(std::min<size_t>(count, 8), std::memory_order_relaxed);
 }
 
 void SetComputeWorkgroupSplit(u32 factor) {
@@ -649,13 +657,18 @@ void PipelineCache::TickResidency(const CacheMemorySnapshot& snapshot, Scheduler
         }
     }
     TickPrewarm(snapshot);
+    prewarm_admission.Observe(snapshot.app_used, snapshot.app_limit);
+    TickColdPrewarm(snapshot);
     // A session closed from the console never reaches the destructor, and the set changes most at
     // the start. A minute at 60 FPS is two or three at the frame rates seen, longer than many test
     // sessions, so save what changed every 10 seconds' worth of frames.
     constexpr u64 HOT_SAVE_FRAMES = 10 * 60;
-    if (hot_pipelines_dirty && residency_frame - last_hot_save_frame >= HOT_SAVE_FRAMES) {
+    if (residency_frame - last_hot_save_frame >= HOT_SAVE_FRAMES) {
         last_hot_save_frame = residency_frame;
-        SaveHotPipelines();
+        if (hot_pipelines_dirty) {
+            SaveHotPipelines();
+        }
+        SaveAdmission(snapshot.app_limit);
     }
     constexpr u64 STATS_FRAMES = 60 * 60;
     if (residency_frame - last_stats_frame >= STATS_FRAMES) {
@@ -698,6 +711,172 @@ void PipelineCache::TickPrewarm(const CacheMemorySnapshot& snapshot) {
         prewarm_order = {};
         prewarm_cursor = 0;
     }
+}
+
+namespace {
+/// One graphics record of the disk cache, read at its offset; nullopt when it is not one there.
+std::optional<std::pair<GraphicsPipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>>
+ReadGraphicsRecord(const std::filesystem::path& path, std::streamoff offset) try {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+    file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    file.seekg(offset);
+    u32 num_envs{};
+    file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+    if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+        return std::nullopt;
+    }
+    std::vector<VideoCommon::FileEnvironment> envs(num_envs);
+    for (auto& env : envs) {
+        env.Deserialize(file);
+    }
+    if (envs.front().ShaderStage() == Shader::Stage::Compute) {
+        return std::nullopt;
+    }
+    GraphicsPipelineCacheKey key;
+    file.read(reinterpret_cast<char*>(&key), sizeof(key));
+    return std::pair{key, std::move(envs)};
+} catch (const std::exception&) {
+    return std::nullopt;
+}
+
+/// What a pipeline adds to the memory ledger: its bookkeeping and its DXIL.
+u64 PipelineLedgerBytes() {
+    return Common::ReadMemoryAccount(Common::MemoryAccount::Pipelines).bytes +
+           Common::ReadMemoryAccount(Common::MemoryAccount::ShaderBytecode).bytes;
+}
+} // namespace
+
+void PipelineCache::TickColdPrewarm(const CacheMemorySnapshot& snapshot) {
+    if (cold_in_flight) {
+        DrainColdPrewarm();
+        if (cold_in_flight) {
+            return;
+        }
+    }
+    if (cold_cursor >= cold_prewarm.size() || pipeline_cache_filename.empty() ||
+        !pipeline_prewarm.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // Records the game drew meanwhile were made for their draw and are no longer stored only.
+    while (cold_cursor < cold_prewarm.size() &&
+           !stored_graphics.contains(cold_prewarm[cold_cursor].hash)) {
+        ++cold_cursor;
+        ++cold_drawn_first;
+    }
+    const auto stop = [&](std::string_view why) {
+        LOG_INFO(Render,
+                 "D3D12: cold prewarm {}: {} made, {} drawn first, {} failed, {} left; spent {} "
+                 "KiB of {} MiB, ~{} KiB each, {} pauses for memory",
+                 why, cold_made, cold_drawn_first, cold_failed,
+                 cold_prewarm.size() - (std::min)(cold_cursor, cold_prewarm.size()),
+                 prewarm_admission.Spent() >> 10, prewarm_admission.Budget() >> 20, prewarm_admission.Cost() >> 10,
+                 prewarm_admission.Pauses());
+        cold_prewarm = decltype(cold_prewarm){};
+        cold_cursor = 0;
+    };
+    if (cold_cursor >= cold_prewarm.size()) {
+        stop("done");
+        return;
+    }
+    if (!prewarm_admission.MayStart(residency_frame, snapshot.app_used, snapshot.app_limit)) {
+        if (prewarm_admission.Exhausted()) {
+            stop("budget spent");
+        }
+        return;
+    }
+    const ColdRecord record = cold_prewarm[cold_cursor++];
+    cold_in_flight = true;
+    cold_ledger_before = PipelineLedgerBytes();
+    prewarm_thread.QueueWork([this, record, path = pipeline_cache_filename] {
+        ColdBuilt built{};
+        try {
+            if (auto read = ReadGraphicsRecord(path, record.offset)) {
+                auto& [key, envs] = *read;
+                key.Canonicalize();
+                if (key.Hash() == record.hash) {
+                    boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+                    for (auto& env : envs) {
+                        env_ptrs.push_back(&env);
+                    }
+                    ShaderPools pools;
+                    built.key = key;
+                    built.pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), false);
+                }
+            }
+        } catch (const std::exception& exception) {
+            LOG_WARNING(Render, "D3D12: cold prewarm of {:016x} failed: {}", record.hash,
+                        exception.what());
+            built.pipeline.reset();
+        }
+        std::scoped_lock lock{cold_mutex};
+        cold_built.emplace(std::move(built));
+        cold_done = true;
+    });
+}
+
+void PipelineCache::DrainColdPrewarm() {
+    std::optional<ColdBuilt> built;
+    {
+        std::scoped_lock lock{cold_mutex};
+        if (!cold_done) {
+            return;
+        }
+        cold_done = false;
+        built = std::move(cold_built);
+        cold_built.reset();
+    }
+    cold_in_flight = false;
+    const u64 after = PipelineLedgerBytes();
+    prewarm_admission.Finished(after > cold_ledger_before ? after - cold_ledger_before : 0);
+    if (!built || !built->pipeline) {
+        ++cold_failed;
+        return;
+    }
+    // Drawn while it was being built: the draw made its own, this one goes.
+    if (graphics_cache.contains(built->key) || !stored_graphics.erase(built->key.Hash())) {
+        ++cold_drawn_first;
+        return;
+    }
+    GraphicsPipeline* const pipeline = built->pipeline.get();
+    // Counted as used now, so eviction does not take it back before its first draw.
+    pipeline->Touch(residency_frame);
+    pipeline->MarkPrewarmed();
+    residency_sweep.push_back(pipeline);
+    graphics_cache.emplace(built->key, std::move(built->pipeline));
+    ++cold_made;
+    GetPipelineStats().prewarm_queued.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::SaveAdmission(u64 app_limit) {
+    if (app_limit == 0 || admission_filename.empty()) {
+        return;
+    }
+    const PrewarmAdmission::Learned learned = prewarm_admission.Learn(app_limit);
+    if (learned.min_free == admission_saved.min_free && learned.spent == admission_saved.spent) {
+        return;
+    }
+    admission_saved = learned;
+    std::array<u8, 24> bytes{'D', '3', 'P', 'A', 1, 0, 0, 0};
+    std::memcpy(bytes.data() + 8, &learned.min_free, 8);
+    std::memcpy(bytes.data() + 16, &learned.spent, 8);
+    serialization_thread.QueueWork([bytes, path = admission_filename] {
+        // Written aside and renamed over the old one, as the hot set.
+        std::filesystem::path temporary = path;
+        temporary += ".tmp";
+        {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()));
+            if (!file) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(temporary, path, ec);
+    });
 }
 
 void PipelineCache::LogPipelineStats(std::string_view when) const {
@@ -948,6 +1127,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     pipeline_cache_filename = base_dir / "d3d12.bin";
     hot_pipelines_filename = base_dir / "d3d12_hot.bin";
+    admission_filename = base_dir / "d3d12_prewarm.bin";
     if (IsDxilDiskCacheEnabled() && compiler.TranslatorGeneration() != 0) {
         GetDxilDiskCache().Open(base_dir / "d3d12_dxil.bin", compiler.TranslatorGeneration());
     } else {
@@ -959,6 +1139,32 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                     std::istreambuf_iterator<char>()};
         hot_pipelines.Load(bytes);
     }
+    bool admission_learned{};
+    {
+        // What the last session learned: {"D3PA", version 1, lowest free memory, spent}.
+        std::ifstream file(admission_filename, std::ios::binary);
+        const std::vector<u8> bytes{std::istreambuf_iterator<char>(file),
+                                    std::istreambuf_iterator<char>()};
+        PrewarmAdmission::Learned learned{};
+        const bool valid = bytes.size() == 24 && std::memcmp(bytes.data(), "D3PA", 4) == 0 &&
+                           bytes[4] == 1 && bytes[5] == 0 && bytes[6] == 0 && bytes[7] == 0;
+        if (valid) {
+            std::memcpy(&learned.min_free, bytes.data() + 8, 8);
+            std::memcpy(&learned.spent, bytes.data() + 16, 8);
+        }
+        prewarm_admission.Start(valid ? &learned : nullptr);
+        admission_learned = valid;
+        admission_saved = valid ? learned : PrewarmAdmission::Learned{};
+    }
+    cold_prewarm.clear();
+    cold_cursor = 0;
+    // Deferred records drawn in a kept session: {last session, file index, record}.
+    struct ColdCandidate {
+        u32 session;
+        size_t file_index;
+        ColdRecord record;
+    };
+    std::vector<ColdCandidate> cold_candidates;
 
     struct {
         std::mutex mutex;
@@ -986,7 +1192,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // itself; tasks give their share back when they end. shortcut: 32 MiB/2x workers are not
     // measured on Series yet; tune from the "disk load queue peak" log line.
     BoundedAdmission admission{2 * static_cast<u64>(GetTotalPipelineWorkers()), 32ULL << 20};
-    std::streamoff record_start{};
+    std::streamoff record_start{12}; ///< After the file's magic and version.
     const auto admit{[&](std::ifstream& file) {
         const std::streamoff end = file.tellg();
         const u64 bytes = end > record_start ? static_cast<u64>(end - record_start) : 0;
@@ -1018,6 +1224,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++state.total;
     }};
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+        const std::streamoff offset = record_start;
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         auto ticket = admit(file);
@@ -1041,6 +1248,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             // Made from the live shaders when first drawn; its DXIL is still in the disk cache.
             stored_graphics.insert(key.Hash());
             ++state.deferred;
+            const u32 session = (std::max)(hot_pipelines.LastSession(key.Hash()),
+                                           hot_pipelines.LastSession(stored_hash));
+            if (session != 0) {
+                cold_candidates.push_back({session, file_index, {key.Hash(), offset}});
+            }
             return;
         }
 
@@ -1121,6 +1333,23 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     prewarm_cursor = 0;
     prewarm_last = nullptr;
+    std::ranges::sort(cold_candidates, [](const ColdCandidate& a, const ColdCandidate& b) {
+        return a.session != b.session ? a.session > b.session : a.file_index < b.file_index;
+    });
+    cold_prewarm.reserve(cold_candidates.size());
+    for (const ColdCandidate& candidate : cold_candidates) {
+        cold_prewarm.push_back(candidate.record);
+    }
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    LOG_INFO(Render,
+             "D3D12: cold prewarm of {} pipelines drawn in recent sessions, budget {} MiB ({}), "
+             "keeping {} MiB free",
+             cold_prewarm.size(), mib(prewarm_admission.Budget()),
+             admission_learned
+                 ? fmt::format("last session spent {} MiB, lowest free {} MiB",
+                               mib(admission_saved.spent), mib(admission_saved.min_free))
+                 : std::string("first session"),
+             mib(PrewarmAdmission::RESERVE));
     LogPipelineStats("boot");
     GetDxilDiskCache().LogStats("boot");
 }
@@ -1133,6 +1362,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         VideoCore::Perf::ScopedTimer timer{VideoCore::Perf::Counter::PipelineStallUs};
         VideoCore::Perf::ScopedTimer frontend{VideoCore::Perf::Counter::PipelineFrontendUs};
         const u64 frontend_start = SteadyMicros();
+        prewarm_admission.NoteDemand(residency_frame);
         pipeline = CreateGraphicsPipeline();
         GetPipelineStats().Record(PipelineStage::Frontend, SteadyMicros() - frontend_start);
         if (pipeline) {

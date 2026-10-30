@@ -6,6 +6,8 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <stop_token>
@@ -81,6 +83,10 @@ void SetTransformFeedbackStorage(bool enabled);
 /// Diagnostics: false never builds dormant PSOs ahead of their first draw, for A/B timing of the
 /// background prewarm. Set before boot (boot.cfg "pso_prewarm=0").
 void SetPipelinePrewarm(bool enabled);
+
+/// Pipeline builder threads, 0 for the default (cores - 1, at most 4): for timing the boot's
+/// pipeline loading and its memory peak at 1, 2 or 4. Set before boot (boot.cfg "pso_workers=").
+void SetPipelineWorkers(size_t count);
 
 /// Compute shaders dispatched with few groups, whose work is a stride loop over their local id,
 /// run each guest group as `factor` real groups (Shader::Optimization::WorkgroupSplitPass) to
@@ -193,6 +199,13 @@ private:
     /// while memory is plentiful (PipelineResidencyPolicy::MayPrewarm).
     void TickPrewarm(const CacheMemorySnapshot& snapshot);
 
+    /// GPU thread, once a frame: takes the cold prewarm's finished pipeline, if any, and queues
+    /// the next record as PrewarmAdmission allows. Draws never wait on it.
+    void TickColdPrewarm(const CacheMemorySnapshot& snapshot);
+    void DrainColdPrewarm();
+    /// GPU thread: keeps what the admission learned for the next session, when it changed.
+    void SaveAdmission(u64 app_limit);
+
     /// Logs each preparation stage's distribution and the waits by cause, totals so far.
     void LogPipelineStats(std::string_view when) const;
 
@@ -289,6 +302,28 @@ private:
     std::vector<GraphicsPipeline*> prewarm_order;
     size_t prewarm_cursor{};
     GraphicsPipeline* prewarm_last{}; ///< Queued last; the next waits until it is built.
+
+    /// Disk-cache records drawn in recent sessions that lazy_cold did not make at boot, most
+    /// recently drawn first, built ahead of their draw within PrewarmAdmission (memory phase 2).
+    struct ColdRecord {
+        u64 hash; ///< Canonical key hash.
+        std::streamoff offset; ///< Where the record starts in pipeline_cache_filename.
+    };
+    struct ColdBuilt {
+        GraphicsPipelineCacheKey key;
+        std::unique_ptr<GraphicsPipeline> pipeline; ///< Null when the record could not be made.
+    };
+    std::vector<ColdRecord> cold_prewarm; ///< GPU thread once loaded.
+    size_t cold_cursor{};
+    bool cold_in_flight{};
+    u64 cold_ledger_before{};
+    u64 cold_made{}, cold_failed{}, cold_drawn_first{};
+    std::mutex cold_mutex;
+    std::optional<ColdBuilt> cold_built; ///< cold_mutex: the prewarm thread's result.
+    bool cold_done{};                    ///< cold_mutex: the job ended.
+    PrewarmAdmission prewarm_admission;  ///< GPU thread once loaded.
+    std::filesystem::path admission_filename;
+    PrewarmAdmission::Learned admission_saved{};
 
     // Last, so they are joined before the pipelines they build are destroyed.
     Common::ThreadWorker workers;

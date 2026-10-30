@@ -70,6 +70,115 @@ struct PipelineResidencyPolicy {
     }
 };
 
+/// Admission of optional work (building pipelines ahead of their first draw) against the app's
+/// memory: it never takes the last RESERVE free, it spends at most a session budget learned from
+/// the last session's worst moment, it measures what each item really cost, and it yields to the
+/// game's own draws. Nothing waits on it: a draw that needs a pipeline builds it as before.
+///
+/// The budget follows the previous session: what it spent plus what it still had free past the
+/// reserve at its lowest (less, when it fell under the reserve). Pipelines stay once made, so a
+/// session that spent X and bottomed out at M would have bottomed out at M + X without them.
+class PrewarmAdmission {
+public:
+    static constexpr std::uint64_t KiB = 1024;
+    static constexpr std::uint64_t MiB = 1024 * KiB;
+    /// Free memory optional work leaves alone: the experiment's reserve (memory phase 0).
+    static constexpr std::uint64_t RESERVE = 256 * MiB;
+    /// Once stopped by memory, it starts again only this much above the line, so it does not
+    /// flap at the edge while the game loads.
+    static constexpr std::uint64_t RESUME_MARGIN = 64 * MiB;
+    /// A pipeline's bookkeeping and DXIL (the PSO is the driver's, outside the app's commit on
+    /// the Series), until measured.
+    static constexpr std::uint64_t INITIAL_COST = 16 * KiB;
+    static constexpr std::uint64_t MIN_COST = 4 * KiB;
+    static constexpr std::uint64_t MAX_COST = 1 * MiB;
+    /// With no last session to learn from.
+    static constexpr std::uint64_t FIRST_SESSION_BUDGET = 16 * MiB;
+    static constexpr std::uint64_t MAX_BUDGET = 256 * MiB;
+    /// Frames without a pipeline made for a draw before optional work runs again: the game's
+    /// draws come first, and new ones arrive in bursts as it enters an area.
+    static constexpr std::uint64_t DEMAND_QUIET_FRAMES = 30;
+
+    struct Learned {
+        std::uint64_t min_free;
+        std::uint64_t spent;
+    };
+
+    /// The session's budget from what the last one learned (none: the first session's).
+    void Start(const Learned* last) noexcept {
+        if (last == nullptr) {
+            budget = FIRST_SESSION_BUDGET;
+        } else {
+            const std::uint64_t room = last->spent + last->min_free;
+            budget = (std::min)(room > RESERVE ? room - RESERVE : 0, MAX_BUDGET);
+        }
+        spent = 0;
+        min_free = UNKNOWN;
+        paused = false;
+        pauses = 0;
+    }
+
+    /// Every frame with the app's memory (limit 0: unknown, nothing learned).
+    void Observe(std::uint64_t used, std::uint64_t limit) noexcept {
+        if (limit != 0) {
+            min_free = (std::min)(min_free, used < limit ? limit - used : 0);
+        }
+    }
+
+    /// A pipeline was made for a draw this frame.
+    void NoteDemand(std::uint64_t frame) noexcept {
+        last_demand = frame;
+        has_demand = true;
+    }
+
+    /// Whether one more item may start now. An unknown limit never admits.
+    [[nodiscard]] bool MayStart(std::uint64_t frame, std::uint64_t used, std::uint64_t limit) noexcept {
+        if (limit == 0 || (has_demand && frame - last_demand < DEMAND_QUIET_FRAMES) ||
+            spent + cost > budget) {
+            return false;
+        }
+        const std::uint64_t free = used < limit ? limit - used : 0;
+        const std::uint64_t needed = RESERVE + cost + (paused ? RESUME_MARGIN : 0);
+        if (free < needed) {
+            pauses += paused ? 0 : 1;
+            paused = true;
+            return false;
+        }
+        paused = false;
+        return true;
+    }
+
+    /// An admitted item ended; measured is what the memory ledger grew by meanwhile.
+    void Finished(std::uint64_t measured) noexcept {
+        const std::uint64_t sample = std::clamp(measured, MIN_COST, MAX_COST);
+        cost = (3 * cost + sample) / 4;
+        spent += sample;
+    }
+
+    /// What to keep for the next session; min_free stays at the limit when nothing was seen.
+    [[nodiscard]] Learned Learn(std::uint64_t limit) const noexcept {
+        return {min_free == UNKNOWN ? limit : min_free, spent};
+    }
+
+    [[nodiscard]] std::uint64_t Budget() const noexcept { return budget; }
+    [[nodiscard]] std::uint64_t Spent() const noexcept { return spent; }
+    [[nodiscard]] std::uint64_t Cost() const noexcept { return cost; }
+    [[nodiscard]] std::uint64_t MinFree() const noexcept { return min_free; }
+    [[nodiscard]] std::uint64_t Pauses() const noexcept { return pauses; }
+    [[nodiscard]] bool Exhausted() const noexcept { return spent + cost > budget; }
+
+private:
+    static constexpr std::uint64_t UNKNOWN = ~std::uint64_t{0};
+    std::uint64_t budget{};
+    std::uint64_t spent{};
+    std::uint64_t cost{INITIAL_COST};
+    std::uint64_t min_free{UNKNOWN};
+    std::uint64_t last_demand{};
+    std::uint64_t pauses{};
+    bool has_demand{};
+    bool paused{};
+};
+
 /// Whether releasing idle PSOs under memory pressure gives commit back, measured on the first
 /// releases: a few hundred are released, eviction pauses until their fences retire, and the drop
 /// in the commit the ledger does not track (DXIL and bookkeeping are tracked) is split among them.
@@ -199,6 +308,12 @@ public:
     /// Whether the pipeline was drawn in one of the kept sessions, built at boot or not.
     [[nodiscard]] bool Known(std::uint64_t hash) const {
         return last_used.contains(hash);
+    }
+
+    /// The last kept session that drew the pipeline, 0 when none did; higher is more recent.
+    [[nodiscard]] std::uint32_t LastSession(std::uint64_t hash) const {
+        const auto it = last_used.find(hash);
+        return it != last_used.end() ? it->second : 0;
     }
 
     /// Marks a pipeline drawn this session; true the first time, when the set needs saving.

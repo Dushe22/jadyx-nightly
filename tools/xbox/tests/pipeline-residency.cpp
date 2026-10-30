@@ -220,6 +220,61 @@ void TestHotSet() {
     for (std::uint64_t hash = 0; hash < HotPipelineSet::MAX_PREWARM; ++hash) {
         assert(big.Known(1'000'000 + hash));
     }
+    assert(big.LastSession(0) > big.LastSession(1'000'000) && big.LastSession(1'000'000) != 0);
+    assert(big.LastSession(999'999) == 0);
+}
+
+void TestPrewarmAdmission() {
+    using A = PrewarmAdmission;
+    const std::uint64_t limit = 5120 * M;
+    // First session: a small fixed budget, admitted with room past the reserve.
+    A a;
+    a.Start(nullptr);
+    assert(a.Budget() == A::FIRST_SESSION_BUDGET);
+    assert(a.MayStart(1, 2000 * M, limit));
+    assert(!a.MayStart(1, 2000 * M, 0)); // unknown limit
+    // The reserve and the item's cost are left free.
+    assert(!a.MayStart(1, limit - A::RESERVE, limit));
+    assert(a.Pauses() == 1);
+    // Paused, it starts again only past the resume margin.
+    assert(!a.MayStart(2, limit - A::RESERVE - 32 * M, limit));
+    assert(a.Pauses() == 1);
+    assert(a.MayStart(3, limit - A::RESERVE - 128 * M, limit));
+    // Demand first: nothing for DEMAND_QUIET_FRAMES after a draw made a pipeline.
+    a.NoteDemand(100);
+    assert(!a.MayStart(100 + A::DEMAND_QUIET_FRAMES - 1, 2000 * M, limit));
+    assert(a.MayStart(100 + A::DEMAND_QUIET_FRAMES, 2000 * M, limit));
+    // Measured costs are clamped and spend the budget until it is gone.
+    a.Finished(0);
+    assert(a.Spent() == A::MIN_COST);
+    a.Finished(100 * M);
+    assert(a.Spent() == A::MIN_COST + A::MAX_COST && a.Cost() <= A::MAX_COST);
+    while (!a.Exhausted()) {
+        a.Finished(A::MAX_COST);
+    }
+    assert(!a.MayStart(1000, 2000 * M, limit) && a.Spent() <= a.Budget() + A::MAX_COST);
+    // What it learns: the session's lowest free memory and what it spent.
+    a.Observe(4000 * M, limit);
+    a.Observe(4900 * M, limit);
+    a.Observe(4500 * M, limit);
+    const A::Learned learned = a.Learn(limit);
+    assert(learned.min_free == 220 * M && learned.spent == a.Spent());
+    // Next session: spent plus what was left past the reserve; under it, the budget shrinks.
+    A b;
+    const A::Learned roomy{A::RESERVE + 100 * M, 20 * M};
+    b.Start(&roomy);
+    assert(b.Budget() == 120 * M);
+    const A::Learned tight{A::RESERVE - 10 * M, 20 * M};
+    b.Start(&tight);
+    assert(b.Budget() == 10 * M);
+    const A::Learned out{8 * M, 20 * M};
+    b.Start(&out);
+    assert(b.Budget() == 0 && !b.MayStart(1, 0, limit));
+    const A::Learned plenty{4 * 1024 * M, 0};
+    b.Start(&plenty);
+    assert(b.Budget() == A::MAX_BUDGET);
+    // Nothing observed: the limit stands in for the free memory.
+    assert(b.Learn(limit).min_free == limit);
 }
 
 } // namespace
@@ -229,6 +284,7 @@ int main() {
     TestPrewarmGate();
     TestReleaseProbe();
     TestHotSet();
+    TestPrewarmAdmission();
     TestLatencyHistogram();
     std::cout << "PASS: idle limits and prewarm gate by headroom, the PSO release probe, hot "
                  "pipeline sessions, decay, prewarm cap, file round trip and stage latency "
