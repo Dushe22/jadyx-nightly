@@ -58,7 +58,9 @@ const char* NameOf(HeapClass heap_class) {
 u64 PoolOf(HeapClass heap_class) {
     switch (heap_class) {
     case HeapClass::Texture:
-        return 64_MiB;
+        // 64 MiB heaps each kept a few survivors after the GC: TOTK on Series held up to 500 MiB
+        // free inside heaps that could not be trimmed. Smaller ones empty and are released sooner.
+        return 32_MiB;
     case HeapClass::RenderTarget:
         return 32_MiB;
     case HeapClass::SmallRenderTarget:

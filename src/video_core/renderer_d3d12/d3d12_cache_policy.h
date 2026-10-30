@@ -51,7 +51,9 @@ public:
             // Hysteresis may retain Emergency with ample headroom. Only actual
             // exhaustion justifies unbounded recovery on the gameplay thread.
             return immediate_recovery ? VideoCommon::TextureGcPolicy{true, true, 10, 40, 0, 40}
-                                      : VideoCommon::TextureGcPolicy{true, true, 10, 40, 1000, 1};
+                                      // TOTK's loads add GPU-written textures faster than one
+                                      // download a frame evicts them (1052 MiB live, 768 cap).
+                                      : VideoCommon::TextureGcPolicy{true, true, 10, 80, 1000, 4};
         }
         if (second_pass && level == CachePressure::Critical)
             return {true, true, 60, 16, 1000, 1};

@@ -40,7 +40,8 @@ int main() {
     auto critical = c.Policy(CachePressure::Critical,true);
     auto emergency = c.Policy(CachePressure::Emergency,true);
     assert(critical.min_age == 60 && critical.max_downloads == 1 && critical.time_budget_us == 1000);
-    assert(emergency.min_age == 10 && emergency.max_downloads == 1 && emergency.time_budget_us == 1000);
+    assert(emergency.min_age == 10 && emergency.max_downloads == 4 && emergency.iterations == 80 &&
+           emergency.time_budget_us == 1000);
     const auto recovery = c.Policy(CachePressure::Emergency, true, true);
     assert(recovery.max_downloads == 40 && recovery.time_budget_us == 0);
     assert(!c.RequiresImmediateRecovery(sample(64*MiB)));
